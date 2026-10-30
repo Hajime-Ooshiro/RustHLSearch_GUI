@@ -234,6 +234,8 @@ struct AppState {
     state: State,
     start_time: Instant,
     search_results: Option<OutputFile<'static>>, // Use lifetime annotation or Box if necessary in a real scenario
+    depth_input: String,
+    search_error: Option<String>,
     // Placeholder for GUI state management
     show_visualization: bool,
 }
@@ -253,12 +255,11 @@ impl AppState {
         
         let all_primes = generate_primes(MAX_PRIME);
         if let Err(message) = self.cli.validate(all_primes.len()) {
-            eprintln!("Error: {}", message);
-            return Ok(());
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, message).into());
         }
 
         let primes = all_primes;
-        info!("HLSearch (Rust) 開始");
+        info!("HLSearch (Rust) GUI Mode Start");
         
         let shift_table = build_shift_table(&primes[..self.cli.depth], self.cli.cols);
         let mut state = State::new(primes, self.cli.cols, shift_table);
@@ -351,8 +352,45 @@ impl AppState {
 
 impl App for AppState {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let mut search_requested = false;
+        egui::TopBottomPanel::top("top_view")
+            .default_height(60.0)
+            .resizable(true)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.heading("TopView");
+                    ui.separator();
+                    ui.label("Depth");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.depth_input)
+                            .desired_width(80.0),
+                    );
+                    search_requested = ui.button("Search").clicked();
+                });
+                if let Some(error) = &self.search_error {
+                    ui.colored_label(egui::Color32::RED, error);
+                }
+            });
+
+        egui::SidePanel::left("side_view")
+            .default_width(260.0)
+            .resizable(true)
+            .show(ctx, |ui| {
+                ui.heading("SideView");
+            });
+
+        if search_requested {
+            self.search_error = match self.depth_input.parse::<usize>() {
+                Ok(depth) => {
+                    self.cli.depth = depth;
+                    self.run_search().err().map(|error| error.to_string())
+                }
+                Err(_) => Some("Depth must be a positive integer".to_string()),
+            };
+        }
+
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("HLSearch Visualization");
+            ui.heading("MainView");
             
             if let Some(result) = &self.search_results {
                 ui.separator();
@@ -381,6 +419,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         state: State::new(generate_primes(MAX_PRIME), cli.cols, build_shift_table(&generate_primes(MAX_PRIME)[..cli.depth], cli.cols)), // Requires complex setup/refactoring here
         start_time: Instant::now(),
         search_results: None,
+        depth_input: cli.depth.to_string(),
+        search_error: None,
         show_visualization: true,
     };
 
@@ -415,6 +455,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 state: State::new(generate_primes(MAX_PRIME), cli.cols, build_shift_table(&generate_primes(MAX_PRIME)[..cli.depth], cli.cols)), 
                 start_time: Instant::now(),
                 search_results: None,
+                depth_input: cli.depth.to_string(),
+                search_error: None,
                 show_visualization: true,
             };
             Box::new(app)
