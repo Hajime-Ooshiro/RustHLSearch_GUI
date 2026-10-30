@@ -11,6 +11,7 @@ use primes::{generate_primes, MAX_PRIME};
 use search::{build_shift_table, SearchMode, State};
 use serde::Serialize;
 use simple_logger::SimpleLogger;
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
@@ -234,10 +235,72 @@ struct AppState {
     state: State,
     start_time: Instant,
     search_results: Option<OutputFile<'static>>, // Use lifetime annotation or Box if necessary in a real scenario
+    search_tree: Vec<TreeNode>,
     depth_input: String,
     search_error: Option<String>,
     // Placeholder for GUI state management
     show_visualization: bool,
+}
+
+struct TreeNode {
+    shift: Option<usize>,
+    parent: Option<usize>,
+    depth: usize,
+    children: Vec<usize>,
+    y: f32,
+}
+
+fn build_search_tree(paths: &[Vec<usize>]) -> Vec<TreeNode> {
+    let mut nodes = vec![TreeNode {
+        shift: None,
+        parent: None,
+        depth: 0,
+        children: Vec::new(),
+        y: 0.0,
+    }];
+    let mut child_indices = HashMap::new();
+
+    for path in paths {
+        let mut parent = 0;
+        for (depth, &shift) in path.iter().enumerate() {
+            let key = (parent, shift);
+            let child = *child_indices.entry(key).or_insert_with(|| {
+                let child = nodes.len();
+                nodes.push(TreeNode {
+                    shift: Some(shift),
+                    parent: Some(parent),
+                    depth: depth + 1,
+                    children: Vec::new(),
+                    y: 0.0,
+                });
+                nodes[parent].children.push(child);
+                child
+            });
+            parent = child;
+        }
+    }
+
+    let mut next_leaf = 0;
+    assign_tree_y(&mut nodes, 0, &mut next_leaf);
+    nodes
+}
+
+fn assign_tree_y(nodes: &mut [TreeNode], index: usize, next_leaf: &mut usize) -> f32 {
+    if nodes[index].children.is_empty() {
+        let y = 48.0 + *next_leaf as f32 * 42.0;
+        *next_leaf += 1;
+        nodes[index].y = y;
+        return y;
+    }
+
+    let children = nodes[index].children.clone();
+    let first_y = assign_tree_y(nodes, children[0], next_leaf);
+    let mut last_y = first_y;
+    for child in children.iter().skip(1) {
+        last_y = assign_tree_y(nodes, *child, next_leaf);
+    }
+    nodes[index].y = (first_y + last_y) / 2.0;
+    nodes[index].y
 }
 
 impl AppState {
@@ -268,7 +331,7 @@ impl AppState {
         // Reset progress bar logic for GUI context if needed
         // For now, we rely on the search function updating internal state/progress reporting mechanisms.
 
-        let (mut completed, result) = match self.cli.mode {
+        let (completed, result) = match self.cli.mode {
             SearchMode::Sequential => {
                 let checkpoint_path = self.cli.output_dir.join("checkpoint.json");
                 let backup_path = self.cli.output_dir.join("checkpoint.bak");
@@ -343,10 +406,79 @@ impl AppState {
             }
         };
 
+        if completed {
+            for filename in ["checkpoint.json", "checkpoint.bak"] {
+                let checkpoint_path = self.cli.output_dir.join(filename);
+                if checkpoint_path.exists() {
+                    std::fs::remove_file(&checkpoint_path)?;
+                    info!("Removed completed search checkpoint: {}", checkpoint_path.display());
+                }
+            }
+        }
+
         // Update AppState results based on search outcome
+        self.search_tree = build_search_tree(&result.result.shifts);
         self.search_results = Some(result);
         Ok(())
     }
+}
+
+fn show_search_tree(ui: &mut egui::Ui, nodes: &[TreeNode], max_score: usize) {
+    let max_depth = nodes.iter().map(|node| node.depth).max().unwrap_or(0);
+    let leaf_count = nodes
+        .iter()
+        .filter(|node| node.children.is_empty())
+        .count()
+        .max(1);
+    let graph_size = egui::vec2(
+        240.0 + max_depth as f32 * 140.0,
+        (leaf_count as f32 * 42.0 + 80.0).max(120.0),
+    );
+
+    egui::ScrollArea::both()
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            let (rect, _) = ui.allocate_exact_size(graph_size, egui::Sense::hover());
+            let painter = ui.painter_at(rect);
+            let x_for_depth = |depth: usize| rect.left() + 60.0 + depth as f32 * 140.0;
+
+            for node in nodes.iter().skip(1) {
+                if let Some(parent) = node.parent {
+                    painter.line_segment(
+                        [
+                            egui::pos2(
+                                x_for_depth(nodes[parent].depth) + 9.0,
+                                rect.top() + nodes[parent].y,
+                            ),
+                            egui::pos2(
+                                x_for_depth(node.depth) - 9.0,
+                                rect.top() + node.y,
+                            ),
+                        ],
+                        egui::Stroke::new(1.0_f32, egui::Color32::from_gray(110)),
+                    );
+                }
+            }
+
+            for node in nodes {
+                let center = egui::pos2(x_for_depth(node.depth), rect.top() + node.y);
+                painter.circle_filled(center, 8.0, egui::Color32::from_rgb(70, 145, 220));
+                let label = match node.shift {
+                    Some(shift) if node.children.is_empty() => {
+                        format!("shift {shift} (score {max_score})")
+                    }
+                    Some(shift) => format!("shift {shift}"),
+                    None => "Start".to_string(),
+                };
+                painter.text(
+                    center + egui::vec2(14.0, 0.0),
+                    egui::Align2::LEFT_CENTER,
+                    label,
+                    egui::FontId::proportional(14.0),
+                    ui.visuals().text_color(),
+                );
+            }
+        });
 }
 
 
@@ -396,11 +528,13 @@ impl App for AppState {
                 ui.separator();
                 ui.label(format!("Search Finished! Max Score: {}", result.result.max_score));
 
-                // --- Tree Visualization Placeholder ---
                 ui.add_space(10.0);
-                ui.label("Search Tree (Visualization Area)");
-                // TODO: Implement actual tree visualization logic here using egui primitives
-                egui::Label::new(egui::RichText::new("Visualization placeholder: Displaying structure based on shifts...").monospace()).sense(egui::Sense::hover());
+                ui.label(format!(
+                    "Best-score paths: {} ({} tree nodes)",
+                    result.result.shifts.len(),
+                    self.search_tree.len().saturating_sub(1)
+                ));
+                show_search_tree(ui, &self.search_tree, result.result.max_score);
             } else {
                 ui.label("Press 'Run Search' to begin visualization.");
             }
@@ -419,6 +553,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         state: State::new(generate_primes(MAX_PRIME), cli.cols, build_shift_table(&generate_primes(MAX_PRIME)[..cli.depth], cli.cols)), // Requires complex setup/refactoring here
         start_time: Instant::now(),
         search_results: None,
+        search_tree: Vec::new(),
         depth_input: cli.depth.to_string(),
         search_error: None,
         show_visualization: true,
@@ -455,6 +590,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 state: State::new(generate_primes(MAX_PRIME), cli.cols, build_shift_table(&generate_primes(MAX_PRIME)[..cli.depth], cli.cols)), 
                 start_time: Instant::now(),
                 search_results: None,
+                search_tree: Vec::new(),
                 depth_input: cli.depth.to_string(),
                 search_error: None,
                 show_visualization: true,
@@ -482,6 +618,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn search_tree_merges_shared_path_prefixes() {
+        let tree = build_search_tree(&[vec![2, 1], vec![2, 0], vec![1, 1]]);
+
+        assert_eq!(tree.len(), 6);
+        assert_eq!(tree[0].children.len(), 2);
+        assert_eq!(tree[1].shift, Some(2));
+        assert_eq!(tree[1].children.len(), 2);
+        assert_eq!(tree[1].parent, Some(0));
+    }
 
     fn test_cli() -> Cli {
         Cli {

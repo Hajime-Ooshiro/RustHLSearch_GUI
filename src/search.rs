@@ -239,9 +239,9 @@ impl State {
             return;
         };
         let status = if completed {
-            "探索完了"
+            "Search completed"
         } else {
-            "探索中断"
+            "Search interrupted"
         };
         progress_bar.finish_with_message(format!(
             "{}: nodes={} best={} hits={}",
@@ -264,7 +264,7 @@ impl State {
         };
         progress_bar.set_position(nodes);
         progress_bar.set_message(format!(
-            "探索中: nodes={} best={} hits={} depth={}",
+            "Searching: nodes={} best={} hits={} depth={}",
             HumanCount(nodes),
             max_score,
             results,
@@ -297,7 +297,7 @@ impl State {
                 return Ok((Vec::new(), Vec::new()));
             }
             return Err(
-                "チェックポイントの結果パスを復元するための RocksDB 出力がありません".to_string(),
+                "Checkpoint result paths not found in RocksDB".to_string(),
             );
         };
         let shifts = if expected_results == 0 {
@@ -308,14 +308,14 @@ impl State {
         let target_shifts = store.load_target_paths()?;
         if shifts.len() < expected_results {
             log::warn!(
-                "RocksDB の結果パス数が期待値より少ないため、DB から読み込める分を使用します (shifts={}/{})",
+                "RocksDB result path count is less than expected, using what's available (shifts={}/{})",
                 shifts.len(),
                 expected_results
             );
         }
         if target_shifts.len() < expected_target_count {
             log::warn!(
-                "RocksDB のターゲットパス数が期待値より少ないため、DB から読み込める分を使用します (targets={}/{})",
+                "RocksDB target path count is less than expected, using what's available (targets={}/{})",
                 target_shifts.len(),
                 expected_target_count
             );
@@ -407,9 +407,7 @@ impl State {
         let (mut stack, mut pending_prefixes) = if let Some(path) = resume_path {
             let checkpoint = Self::load_checkpoint(path)?;
             if checkpoint.mode != SearchMode::Sequential {
-                return Err(
-                    "並列モードのチェックポイントは --mode parallel でのみ再開できます".into(),
-                );
+                return Err("Parallel mode checkpoint can only be resumed with --mode parallel".into());
             }
             self.apply_checkpoint_config(&checkpoint, depth)?;
             self.key = checkpoint.key.clone();
@@ -425,7 +423,7 @@ impl State {
                 .map_err(std::io::Error::other)?;
             self.node_count = checkpoint.node_count;
             info!(
-                "チェックポイントから探索を再開しました (nodes={})",
+                "Checkpoint resumed search (nodes={})",
                 checkpoint.node_count
             );
 
@@ -435,10 +433,10 @@ impl State {
             )
         } else if let Some(previous_paths) = self.load_previous_depth_paths(depth)? {
             info!(
-                "depth={} の開始パスとして depth={} の保存済みパス {} 件を使用します",
-                depth,
+                "Using {} saved paths from depth {} as starting points for depth {}",
+                previous_paths.len(),
                 depth - 1,
-                previous_paths.len()
+                depth
             );
             (Vec::new(), previous_paths.into_iter().rev().collect())
         } else {
@@ -485,7 +483,7 @@ impl State {
                 });
                 continue;
             }
-            let frame = stack.last_mut().expect("探索スタックが空です");
+            let frame = stack.last_mut().expect("Search stack is empty");
             if frame.next_idx == 0 {
                 stack.pop();
                 if stack.last().is_some() {
@@ -513,7 +511,7 @@ impl State {
                     self.key.len(),
                 );
                 info!(
-                    "探索経過: nodes={} best={} hits={} depth={}",
+                    "Search progress: nodes={} best={} hits={} depth={}",
                     self.node_count,
                     self.max_score,
                     self.results,
@@ -557,7 +555,7 @@ impl State {
         if let Some(store) = &self.shift_path_store {
             store.flush().map_err(std::io::Error::other)?;
         }
-        info!("探索完了 (nodes={})", self.node_count);
+        info!("Search completed (nodes={})", self.node_count);
         if let Some(path) = checkpoint_path {
             self.write_checkpoint(path, depth, &stack)?;
         }
@@ -626,7 +624,7 @@ impl State {
     ) -> Result<(), Box<dyn std::error::Error>> {
         if checkpoint.depth != depth {
             return Err(format!(
-                "チェックポイントの探索深さが現在の設定と一致しません (depth={})",
+                "Checkpoint search depth does not match current configuration (depth={})",
                 checkpoint.depth
             )
             .into());
@@ -635,7 +633,7 @@ impl State {
         if checkpoint.config_hash != 0 && checkpoint.config_hash != current_hash {
             return Err(
                 format!(
-                    "チェックポイントの設定が異なります。別の --output-dir を使用してください (checkpoint_hash={}, current_hash={})",
+                    "Checkpoint configuration does not match current settings. Please use a different --output-dir (checkpoint_hash={}, current_hash={})",
                     checkpoint.config_hash, current_hash
                 )
                 .into(),
@@ -721,12 +719,12 @@ impl State {
             let checkpoint = Self::load_checkpoint(path)?;
             if checkpoint.mode != SearchMode::Parallel {
                 return Err(
-                    "逐次モードのチェックポイントは --mode sequential でのみ再開できます".into(),
+                    "Sequential mode checkpoint can only be resumed with --mode sequential".into(),
                 );
             }
             self.apply_checkpoint_config(&checkpoint, depth)?;
             if checkpoint.split_depth > depth {
-                return Err("チェックポイントの split_depth が depth を超えています".into());
+                return Err("Checkpoint split_depth exceeds current depth".into());
             }
             split_depth = checkpoint.split_depth;
             checkpoint_work_prefixes = checkpoint.work_prefixes;
@@ -760,7 +758,7 @@ impl State {
                     .collect();
             }
             info!(
-                "チェックポイントから並列探索を再開しました (nodes={})",
+                "Checkpoint resumed parallel search (nodes={})",
                 checkpoint.node_count
             );
         }
@@ -775,10 +773,10 @@ impl State {
             }
             let work_items = self.previous_depth_work_items(depth, previous_paths)?;
             info!(
-                "depth={} の開始ワーク項目として depth={} の保存済みパス {} 件を使用します",
-                depth,
+                "Using {} saved paths from depth {} as starting points for depth {}",
+                work_items.len(),
                 depth - 1,
-                work_items.len()
+                depth
             );
             work_items
         } else {
@@ -822,7 +820,7 @@ impl State {
             store.flush().map_err(std::io::Error::other)?;
         }
         info!(
-            "並列探索完了 (nodes={})",
+            "Parallel search completed (nodes={})",
             node_count.load(Ordering::Relaxed)
         );
         if ctx.checkpoint_path.is_some() {
@@ -841,11 +839,11 @@ impl State {
         let mut jobs = Vec::new();
         for (index, item) in progress.in_progress.iter() {
             if *index >= work_items.len() {
-                return Err("チェックポイントの work_index が範囲外です".into());
+                return Err("Checkpoint work_index is out of bounds".into());
             }
             if progress.completed.contains(index) {
                 return Err(
-                    "チェックポイントで完了済みと実行中の work_index が重複しています".into(),
+                    "Checkpoint has both completed and in-progress work_index".into(),
                 );
             }
             jobs.push(ParallelJob {
@@ -958,7 +956,7 @@ impl State {
                     key.len(),
                 );
                 info!(
-                    "探索経過: nodes={} hit={} depth={} key={:?}",
+                    "Search progress: nodes={} hit={} depth={} key={:?}",
                     n,
                     shared.results,
                     key.len(),
@@ -1050,7 +1048,7 @@ impl State {
             match ctx.checkpoint_lock.try_lock() {
                 Ok(guard) => guard,
                 Err(_) => {
-                    log::debug!("チェックポイント書き込みスキップ (別スレッドが実行中)");
+                    log::debug!("Skipping checkpoint write (another thread is writing)");
                     return Ok(());
                 }
             }
@@ -1152,7 +1150,7 @@ impl State {
         let mut work_items = Vec::with_capacity(prefixes.len());
         for key in prefixes {
             if key.is_empty() || key.len() > depth {
-                return Err(format!("チェックポイントの開始パス長が不正です: {:?}", key));
+                return Err(format!("Invalid checkpoint starting path length: {:?}", key));
             }
             if key
                 .iter()
@@ -1160,7 +1158,7 @@ impl State {
                 .any(|(level, &shift)| shift >= self.primes[level])
             {
                 return Err(format!(
-                    "保存済みシフトパスに範囲外の値が含まれています: {:?}",
+                    "Saved shift path contains an out-of-range value: {:?}",
                     key
                 ));
             }
