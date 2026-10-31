@@ -5,23 +5,53 @@ mod search;
 mod rocksdb_output;
 
 use clap::Parser;
-use log::{info, LevelFilter};
+use log::{info, Level, LevelFilter, Log, Metadata, Record};
 use output::with_timestamp;
 use primes::{generate_primes, MAX_PRIME};
 use search::{build_shift_table, SearchMode, State};
 use serde::Serialize;
-use simple_logger::SimpleLogger;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use eframe::{egui, App, Frame};
 
 const CHECKPOINT_FILENAME: &str = "checkpoint.json";
 const CHECKPOINT_BACKUP_FILENAME: &str = "checkpoint.bak";
+const MAX_LOG_ENTRIES: usize = 500;
+
+struct UiLogger {
+    entries: Arc<Mutex<VecDeque<String>>>,
+}
+
+impl Log for UiLogger {
+    fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+        metadata.level() <= Level::Info
+    }
+
+    fn log(&self, record: &Record<'_>) {
+        if !self.enabled(record.metadata()) {
+            return;
+        }
+
+        let entry = format!("[{}] {}", record.level(), record.args());
+        eprintln!("{entry}");
+
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if entries.len() == MAX_LOG_ENTRIES {
+            entries.pop_front();
+        }
+        entries.push_back(entry);
+    }
+
+    fn flush(&self) {}
+}
 
 #[derive(Serialize)]
 struct OutputFile<'a> {
@@ -238,6 +268,7 @@ struct AppState {
     search_tree: Vec<TreeNode>,
     depth_input: String,
     search_error: Option<String>,
+    log_entries: Arc<Mutex<VecDeque<String>>>,
     // Placeholder for GUI state management
     show_visualization: bool,
 }
@@ -504,11 +535,31 @@ impl App for AppState {
                 }
             });
 
-        egui::SidePanel::left("side_view")
-            .default_width(260.0)
+        egui::TopBottomPanel::bottom("bottom_view")
+            .default_height(120.0)
             .resizable(true)
             .show(ctx, |ui| {
-                ui.heading("SideView");
+                ui.heading("BottomView");
+                ui.separator();
+
+                let entries = self
+                    .log_entries
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if entries.is_empty() {
+                    ui.label("ログはありません");
+                } else {
+                    egui::ScrollArea::vertical()
+                        .stick_to_bottom(true)
+                        .show(ui, |ui| {
+                            for entry in entries {
+                                ui.monospace(entry);
+                            }
+                        });
+                }
             });
 
         if search_requested {
@@ -556,11 +607,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         search_tree: Vec::new(),
         depth_input: cli.depth.to_string(),
         search_error: None,
+        log_entries: Arc::new(Mutex::new(VecDeque::new())),
         show_visualization: true,
     };
 
     // 2. Setup logging and other initializations (kept for compatibility)
-    SimpleLogger::new().with_level(LevelFilter::Info).init()?;
+    let log_entries = Arc::clone(&initial_state.log_entries);
+    log::set_boxed_logger(Box::new(UiLogger {
+        entries: Arc::clone(&log_entries),
+    }))?;
+    log::set_max_level(LevelFilter::Info);
     let interrupted = Arc::new(AtomicBool::new(false));
     {
         let interrupted = Arc::clone(&interrupted);
@@ -593,6 +649,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 search_tree: Vec::new(),
                 depth_input: cli.depth.to_string(),
                 search_error: None,
+                log_entries: Arc::clone(&log_entries),
                 show_visualization: true,
             };
             Box::new(app)
