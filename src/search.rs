@@ -10,6 +10,8 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+const SHIFT_PATH_BATCH_SIZE: usize = 256;
+
 /// 基底行の生成と補集合シフトテーブルの作成
 pub fn build_shift_table(primes: &[usize], cols: usize) -> Vec<Vec<BitMask>> {
     let mut shift_table = Vec::with_capacity(primes.len());
@@ -90,6 +92,40 @@ pub struct SharedResults {
     pub target_count: usize,
     pub target_shifts: Vec<Vec<usize>>,
     pub node_count: u64,
+}
+
+#[derive(Default)]
+pub struct SearchProgress {
+    node_count: AtomicU64,
+    max_score: AtomicUsize,
+    results: AtomicUsize,
+    depth: AtomicUsize,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SearchProgressSnapshot {
+    pub node_count: u64,
+    pub max_score: usize,
+    pub results: usize,
+    pub depth: usize,
+}
+
+impl SearchProgress {
+    pub fn snapshot(&self) -> SearchProgressSnapshot {
+        SearchProgressSnapshot {
+            node_count: self.node_count.load(Ordering::Relaxed),
+            max_score: self.max_score.load(Ordering::Relaxed),
+            results: self.results.load(Ordering::Relaxed),
+            depth: self.depth.load(Ordering::Relaxed),
+        }
+    }
+
+    fn update(&self, nodes: u64, max_score: usize, results: usize, depth: usize) {
+        self.node_count.store(nodes, Ordering::Relaxed);
+        self.max_score.store(max_score, Ordering::Relaxed);
+        self.results.store(results, Ordering::Relaxed);
+        self.depth.store(depth, Ordering::Relaxed);
+    }
 }
 
 struct ParallelResults {
@@ -185,6 +221,7 @@ struct ParallelSearchCtx<'a> {
     checkpoint_lock: Mutex<()>,
     last_checkpoint_nodes: AtomicU64,
     progress_bar: Option<ProgressBar>,
+    progress_reporter: Option<&'a SearchProgress>,
 }
 
 struct ParallelJob {
@@ -208,6 +245,7 @@ pub struct State {
     shift_table: Vec<Vec<BitMask>>,
     shift_path_store: Option<ShiftPathStore>,
     progress_bar: Option<ProgressBar>,
+    progress_reporter: Option<Arc<SearchProgress>>,
 }
 
 impl State {
@@ -227,7 +265,12 @@ impl State {
             shift_table,
             shift_path_store: None,
             progress_bar: None,
+            progress_reporter: None,
         }
+    }
+
+    pub fn set_progress_reporter(&mut self, reporter: Arc<SearchProgress>) {
+        self.progress_reporter = Some(reporter);
     }
 
     pub fn set_progress_bar(&mut self, progress_bar: ProgressBar) {
@@ -254,11 +297,15 @@ impl State {
 
     fn update_progress(
         progress_bar: Option<&ProgressBar>,
+        progress_reporter: Option<&SearchProgress>,
         nodes: u64,
         max_score: usize,
         results: usize,
         depth: usize,
     ) {
+        if let Some(reporter) = progress_reporter {
+            reporter.update(nodes, max_score, results, depth);
+        }
         let Some(progress_bar) = progress_bar else {
             return;
         };
@@ -283,6 +330,16 @@ impl State {
             ShiftPathStore::create(path, depth, clear_existing, config_hash)
                 .map_err(std::io::Error::other)?,
         );
+        Ok(())
+    }
+
+    fn submit_shift_path_batch(
+        &self,
+        pending: &mut Vec<(usize, Vec<usize>)>,
+    ) -> Result<(), String> {
+        if let Some(store) = &self.shift_path_store {
+            store.append_batch(std::mem::take(pending))?;
+        }
         Ok(())
     }
 
@@ -341,12 +398,6 @@ impl State {
 
     fn aggregate_leaf_result(&mut self, score: usize, key: &[usize]) -> Result<(), String> {
         if score < self.target {
-            info!(
-                "target break (depth={} score={}, key={:?})",
-                self.key.len(),
-                score,
-                key
-            );
             return Ok(());
         }
         if score > self.max_score {
@@ -449,9 +500,11 @@ impl State {
             )
         };
         let mut masks = self.rebuild_masks(depth, &self.key);
+        let mut pending_appends = Vec::with_capacity(SHIFT_PATH_BATCH_SIZE);
         let mut checkpoint_due = false;
         Self::update_progress(
             self.progress_bar.as_ref(),
+            self.progress_reporter.as_deref(),
             self.node_count,
             self.max_score,
             self.results,
@@ -460,12 +513,19 @@ impl State {
 
         loop {
             if interrupted.load(Ordering::SeqCst) {
+                self.submit_shift_path_batch(&mut pending_appends)
+                    .map_err(std::io::Error::other)?;
+                if let Some(store) = &self.shift_path_store {
+                    store.flush().map_err(std::io::Error::other)?;
+                }
                 if let Some(path) = checkpoint_path {
                     self.write_checkpoint(path, depth, &stack)?;
                 }
                 return Ok(false);
             }
             if checkpoint_due {
+                self.submit_shift_path_batch(&mut pending_appends)
+                    .map_err(std::io::Error::other)?;
                 if let Some(path) = checkpoint_path {
                     self.write_checkpoint(path, depth, &stack)?;
                 }
@@ -505,6 +565,7 @@ impl State {
             if self.node_count.is_multiple_of(self.checkpoint_interval) {
                 Self::update_progress(
                     self.progress_bar.as_ref(),
+                    self.progress_reporter.as_deref(),
                     self.node_count,
                     self.max_score,
                     self.results,
@@ -521,20 +582,16 @@ impl State {
             }
 
             if count < self.target {
-                info!(
-                    "target break (depth={} count={}, key={:?})",
-                    self.key.len(),
-                    count,
-                    self.key
-                );
                 self.key.pop();
                 continue;
             }
 
-            if let Some(store) = &self.shift_path_store {
-                store
-                    .append(count, &self.key)
-                    .map_err(std::io::Error::other)?;
+            if self.shift_path_store.is_some() {
+                pending_appends.push((count, self.key.clone()));
+                if pending_appends.len() >= SHIFT_PATH_BATCH_SIZE {
+                    self.submit_shift_path_batch(&mut pending_appends)
+                        .map_err(std::io::Error::other)?;
+                }
             }
 
             if level + 1 >= depth {
@@ -552,6 +609,8 @@ impl State {
                 next_idx: self.primes[level + 1],
             });
         }
+        self.submit_shift_path_batch(&mut pending_appends)
+            .map_err(std::io::Error::other)?;
         if let Some(store) = &self.shift_path_store {
             store.flush().map_err(std::io::Error::other)?;
         }
@@ -568,6 +627,9 @@ impl State {
         depth: usize,
         stack: &[Frame],
     ) -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(store) = &self.shift_path_store {
+            store.flush().map_err(std::io::Error::other)?;
+        }
         self.write_checkpoint_file(
             path,
             &Checkpoint {
@@ -803,10 +865,12 @@ impl State {
             checkpoint_lock: Mutex::new(()),
             last_checkpoint_nodes: AtomicU64::new(node_count.load(Ordering::Relaxed)),
             progress_bar: self.progress_bar.clone(),
+            progress_reporter: self.progress_reporter.as_deref(),
         };
         let shared = results.snapshot();
         Self::update_progress(
             ctx.progress_bar.as_ref(),
+            ctx.progress_reporter,
             node_count.load(Ordering::Relaxed),
             shared.max_score,
             shared.results,
@@ -916,14 +980,16 @@ impl State {
         if masks[key.len()].count_ones() < self.target {
             self.finish_parallel_job(index, ctx)?;
             return Ok(());
-        }
+        };
 
         self.store_parallel_progress(index, &stack, &key, ctx);
         let mut local_nodes = 0_u64;
+        let mut pending_appends = Vec::with_capacity(SHIFT_PATH_BATCH_SIZE);
 
         while let Some(frame) = stack.last_mut() {
             if ctx.interrupted.load(Ordering::SeqCst) {
                 ctx.node_count.fetch_add(local_nodes, Ordering::Relaxed);
+                self.submit_shift_path_batch(&mut pending_appends)?;
                 self.store_parallel_progress(index, &stack, &key, ctx);
                 return Ok(());
             }
@@ -945,11 +1011,13 @@ impl State {
                 node_masks[0].bitand_into_count(&base_masks[level], &self.shift_table[level][idx]);
 
             if local_nodes == self.checkpoint_interval {
+                self.submit_shift_path_batch(&mut pending_appends)?;
                 let n = ctx.node_count.fetch_add(local_nodes, Ordering::Relaxed) + local_nodes;
                 local_nodes = 0;
                 let shared = ctx.results.snapshot();
                 Self::update_progress(
                     ctx.progress_bar.as_ref(),
+                    ctx.progress_reporter,
                     n,
                     shared.max_score,
                     shared.results,
@@ -967,21 +1035,19 @@ impl State {
             }
 
             if c_count < self.target {
-                info!(
-                    "target break (depth={}, count={}, key={:?})",
-                    key.len(),
-                    c_count,
-                    key
-                );
                 key.pop();
                 continue;
             }
 
-            if let Some(store) = &ctx.results.shift_path_store {
-                store.append(c_count, &key)?;
+            if ctx.results.shift_path_store.is_some() {
+                pending_appends.push((c_count, key.clone()));
+                if pending_appends.len() >= SHIFT_PATH_BATCH_SIZE {
+                    self.submit_shift_path_batch(&mut pending_appends)?;
+                }
             }
 
             if level + 1 >= depth {
+                self.submit_shift_path_batch(&mut pending_appends)?;
                 ctx.results.record_target(depth, c_count, &key)?;
                 ctx.results.record_path(c_count, &key)?;
                 key.pop();
@@ -994,6 +1060,7 @@ impl State {
             });
         }
 
+        self.submit_shift_path_batch(&mut pending_appends)?;
         ctx.node_count.fetch_add(local_nodes, Ordering::Relaxed);
         self.finish_parallel_job(index, ctx)
     }
@@ -1059,15 +1126,22 @@ impl State {
             return Ok(());
         }
 
+        let progress = ctx.progress.lock().unwrap();
+        let results = ctx.results.results.lock().unwrap();
+        if let Some(store) = &ctx.results.shift_path_store {
+            store.flush().map_err(|err| err.to_string())?;
+        }
         let (completed, in_progress) = {
-            let progress = ctx.progress.lock().unwrap();
             let mut completed: Vec<_> = progress.completed.iter().copied().collect();
             completed.sort_unstable();
             let mut in_progress: Vec<_> = progress.in_progress.values().cloned().collect();
             in_progress.sort_by_key(|item| item.work_index);
             (completed, in_progress)
         };
-        let shared = ctx.results.snapshot();
+        let mut shared = results.clone();
+        shared.max_score = ctx.results.max_score.load(Ordering::Relaxed);
+        drop(results);
+        drop(progress);
         self.write_checkpoint_file(
             path,
             &Checkpoint {
@@ -1109,6 +1183,7 @@ impl State {
             key: Vec::with_capacity(split_depth),
             base_mask: self.zero_mask.clone(),
         }];
+        let mut pending_appends = Vec::with_capacity(SHIFT_PATH_BATCH_SIZE);
 
         for level in 0..split_depth {
             let mut next_items = Vec::with_capacity(work_items.len() * self.primes[level]);
@@ -1122,8 +1197,11 @@ impl State {
                     if count < self.target {
                         continue;
                     }
-                    if let Some(store) = &self.shift_path_store {
-                        store.append(count, &key)?;
+                    if self.shift_path_store.is_some() {
+                        pending_appends.push((count, key.clone()));
+                        if pending_appends.len() >= SHIFT_PATH_BATCH_SIZE {
+                            self.submit_shift_path_batch(&mut pending_appends)?;
+                        }
                     }
                     next_items.push(WorkItem { key, base_mask });
                 }
@@ -1131,6 +1209,7 @@ impl State {
             work_items = next_items;
         }
 
+        self.submit_shift_path_batch(&mut pending_appends)?;
         Ok(work_items)
     }
 
@@ -1148,6 +1227,7 @@ impl State {
         prefixes: ShiftPaths,
     ) -> Result<Vec<WorkItem>, String> {
         let mut work_items = Vec::with_capacity(prefixes.len());
+        let mut pending_appends = Vec::with_capacity(SHIFT_PATH_BATCH_SIZE);
         for key in prefixes {
             if key.is_empty() || key.len() > depth {
                 return Err(format!("Invalid checkpoint starting path length: {:?}", key));
@@ -1168,11 +1248,15 @@ impl State {
             if count < self.target {
                 continue;
             }
-            if let Some(store) = &self.shift_path_store {
-                store.append(count, &key)?;
+            if self.shift_path_store.is_some() {
+                pending_appends.push((count, key.clone()));
+                if pending_appends.len() >= SHIFT_PATH_BATCH_SIZE {
+                    self.submit_shift_path_batch(&mut pending_appends)?;
+                }
             }
             work_items.push(WorkItem { key, base_mask });
         }
+        self.submit_shift_path_batch(&mut pending_appends)?;
         Ok(work_items)
     }
 }
@@ -1190,6 +1274,22 @@ mod tests {
         assert_eq!(table[0].len(), 2);
         assert_eq!(table[0][0].count_ones(), 3);
         assert_eq!(table[0][1].count_ones(), 3);
+    }
+
+    #[test]
+    fn progress_reporter_exposes_latest_search_metrics() {
+        let progress = super::SearchProgress::default();
+        progress.update(12_345, 450, 7, 4);
+
+        assert_eq!(
+            progress.snapshot(),
+            super::SearchProgressSnapshot {
+                node_count: 12_345,
+                max_score: 450,
+                results: 7,
+                depth: 4,
+            }
+        );
     }
 
     #[test]

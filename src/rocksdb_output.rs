@@ -124,11 +124,18 @@ impl ShiftPathStore {
         if path.is_empty() {
             return Ok(());
         }
+        self.append_batch(vec![(max_count, path.to_vec())])
+    }
+
+    pub fn append_batch(&self, mut appends: Vec<(usize, Vec<usize>)>) -> Result<(), String> {
+        if appends.is_empty() {
+            return Ok(());
+        }
         let mut buffer = self
             .pending_appends
             .lock()
             .map_err(|_| "バッファのロック取得に失敗しました".to_string())?;
-        buffer.push((max_count, path.to_vec()));
+        buffer.append(&mut appends);
         Ok(())
     }
 
@@ -404,10 +411,14 @@ mod tests {
     fn appends_reusable_parent_nodes_and_reconstructs_leaves_in_order() {
         let path = database_path();
         let store = ShiftPathStore::create(&path, 2, true, 12345).unwrap();
-        store.append(10, &[1]).unwrap();
-        store.append(10, &[1, 2]).unwrap();
-        store.append(11, &[1, 3]).unwrap();
-        store.append(11, &[1, 3]).unwrap();
+        store
+            .append_batch(vec![
+                (10, vec![1]),
+                (10, vec![1, 2]),
+                (11, vec![1, 3]),
+                (11, vec![1, 3]),
+            ])
+            .unwrap();
 
         assert_eq!(
             store.load_full_depth_paths(2).unwrap(),

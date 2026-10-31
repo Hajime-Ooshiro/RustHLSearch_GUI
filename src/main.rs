@@ -8,7 +8,7 @@ use clap::Parser;
 use log::{info, Level, LevelFilter, Log, Metadata, Record};
 use output::with_timestamp;
 use primes::{generate_primes, MAX_PRIME};
-use search::{build_shift_table, SearchMode, State};
+use search::{build_shift_table, SearchMode, SearchProgress, State};
 use serde::Serialize;
 use std::collections::{HashMap, VecDeque};
 use std::fs::File;
@@ -16,15 +16,18 @@ use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 use eframe::{egui, App, Frame};
 
 const CHECKPOINT_FILENAME: &str = "checkpoint.json";
 const CHECKPOINT_BACKUP_FILENAME: &str = "checkpoint.bak";
+const LOG_FILENAME: &str = "hlsearch.log";
 const MAX_LOG_ENTRIES: usize = 500;
 
 struct UiLogger {
     entries: Arc<Mutex<VecDeque<String>>>,
+    writer: Mutex<BufWriter<File>>,
 }
 
 impl Log for UiLogger {
@@ -39,6 +42,14 @@ impl Log for UiLogger {
 
         let entry = format!("[{}] {}", record.level(), record.args());
         eprintln!("{entry}");
+
+        let mut writer = self
+            .writer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Err(error) = writeln!(writer, "{entry}").and_then(|()| writer.flush()) {
+            eprintln!("Failed to write log file: {error}");
+        }
 
         let mut entries = self
             .entries
@@ -262,15 +273,15 @@ impl Cli {
 
 struct AppState {
     cli: Cli,
-    state: State,
     start_time: Instant,
     search_results: Option<OutputFile<'static>>, // Use lifetime annotation or Box if necessary in a real scenario
     search_tree: Vec<TreeNode>,
     depth_input: String,
     search_error: Option<String>,
     log_entries: Arc<Mutex<VecDeque<String>>>,
-    // Placeholder for GUI state management
-    show_visualization: bool,
+    search_progress: Arc<SearchProgress>,
+    search_thread: Option<JoinHandle<Result<OutputFile<'static>, String>>>,
+    is_searching: bool,
 }
 
 struct TreeNode {
@@ -335,125 +346,133 @@ fn assign_tree_y(nodes: &mut [TreeNode], index: usize, next_leaf: &mut usize) ->
 }
 
 impl AppState {
-    fn run_search(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+    fn start_search(&mut self) {
         let start_time = Instant::now();
         self.start_time = start_time;
+        self.search_error = None;
+        self.search_results = None;
+        self.search_tree.clear();
+        self.search_progress = Arc::new(SearchProgress::default());
 
-        // Re-run setup logic needed before calling search methods, 
-        // or refactor search_with_checkpoint_interruptible/search_parallel_interruptible 
-        // to return necessary state components for GUI display.
+        let cli = self.cli.clone();
+        let progress = Arc::clone(&self.search_progress);
+        self.search_thread = Some(std::thread::spawn(move || {
+            run_search(cli, progress, start_time)
+        }));
+        self.is_searching = true;
+    }
 
-        // --- WARNING: For simplicity, we re-initialize and run the whole flow here ---
-        // In a real application, you'd pass results from main() into AppState during setup.
-        info!("Re-running search logic within GUI context...");
-        
-        let all_primes = generate_primes(MAX_PRIME);
-        if let Err(message) = self.cli.validate(all_primes.len()) {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, message).into());
-        }
-
-        let primes = all_primes;
-        info!("HLSearch (Rust) GUI Mode Start");
-        
-        let shift_table = build_shift_table(&primes[..self.cli.depth], self.cli.cols);
-        let mut state = State::new(primes, self.cli.cols, shift_table);
-        state.checkpoint_interval = self.cli.checkpoint_interval;
-        
-        // Reset progress bar logic for GUI context if needed
-        // For now, we rely on the search function updating internal state/progress reporting mechanisms.
-
-        let (completed, result) = match self.cli.mode {
-            SearchMode::Sequential => {
-                let checkpoint_path = self.cli.output_dir.join("checkpoint.json");
-                let backup_path = self.cli.output_dir.join("checkpoint.bak");
-                let resume_path = if checkpoint_path.exists() {
-                    Some(checkpoint_path.as_path())
-                } else {
-                    backup_path.exists().then_some(backup_path.as_path())
-                };
-
-                state.set_shift_path_store(&self.cli.output_dir.join("HLSearch.rocksdb"), self.cli.depth, resume_path.is_none())?;
-                
-                let completed = state.search_with_checkpoint_interruptible(
-                    self.cli.depth,
-                    Some(&checkpoint_path),
-                    resume_path,
-                    &Arc::new(std::sync::atomic::AtomicBool::new(false)), // Dummy interruption handling for GUI context start
-                )?;
-                
-                let result = OutputFile {
-                    config: OutputConfig {
-                        mode: "sequential",
-                        depth: self.cli.depth,
-                        cols: self.cli.cols,
-                        elapsed: format!("{:?}", start_time.elapsed()),
-                    },
-                    result: OutputResult {
-                        max_score: state.max_score,
-                        results: state.results,
-                        shifts: state.shifts,
-                        target_count: state.target_count,
-                        target_shifts: state.target_shifts,
-                    },
-                };
-
-                (completed, result)
-            }
-            SearchMode::Parallel => {
-                 // Similar complex initialization for parallel mode...
-                let checkpoint_path = self.cli.output_dir.join("checkpoint.json");
-                let backup_path = self.cli.output_dir.join("checkpoint.bak");
-                let resume_path = if checkpoint_path.exists() {
-                    Some(checkpoint_path.as_path())
-                } else {
-                    backup_path.exists().then_some(backup_path.as_path())
-                };
-
-                state.set_shift_path_store(&self.cli.output_dir.join("HLSearch.rocksdb"), self.cli.depth, resume_path.is_none())?;
-                let (result, completed) = state.search_parallel_interruptible(
-                    self.cli.depth,
-                    Some(&checkpoint_path),
-                    resume_path,
-                    &Arc::new(std::sync::atomic::AtomicBool::new(false)), // Dummy interruption handling for GUI context start
-                )?;
-                
-                let result_data = OutputFile {
-                    config: OutputConfig {
-                        mode: "parallel",
-                        depth: self.cli.depth,
-                        cols: self.cli.cols,
-                        elapsed: format!("{:?}", start_time.elapsed()),
-                    },
-                    result: OutputResult {
-                        max_score: result.max_score,
-                        results: result.results,
-                        shifts: result.shifts,
-                        target_count: result.target_count,
-                        target_shifts: result.target_shifts,
-                    }
-                };
-
-                (completed, result_data)
-            }
+    fn finish_search(&mut self) {
+        let Some(search_thread) = self.search_thread.take() else {
+            return;
         };
-
-        if completed {
-            for filename in ["checkpoint.json", "checkpoint.bak"] {
-                let checkpoint_path = self.cli.output_dir.join(filename);
-                if checkpoint_path.exists() {
-                    std::fs::remove_file(&checkpoint_path)?;
-                    info!("Removed completed search checkpoint: {}", checkpoint_path.display());
-                }
+        self.is_searching = false;
+        match search_thread.join() {
+            Ok(Ok(result)) => {
+                self.search_tree = build_search_tree(&result.result.shifts);
+                self.search_results = Some(result);
             }
+            Ok(Err(error)) => self.search_error = Some(error),
+            Err(_) => self.search_error = Some("Search thread panicked".to_string()),
         }
-
-        // Update AppState results based on search outcome
-        self.search_tree = build_search_tree(&result.result.shifts);
-        self.search_results = Some(result);
-        Ok(())
     }
 }
 
+fn run_search(
+    cli: Cli,
+    progress: Arc<SearchProgress>,
+    start_time: Instant,
+) -> Result<OutputFile<'static>, String> {
+    let all_primes = generate_primes(MAX_PRIME);
+    cli.validate(all_primes.len())?;
+    info!("HLSearch (Rust) GUI Mode Start");
+
+    let shift_table = build_shift_table(&all_primes[..cli.depth], cli.cols);
+    let mut state = State::new(all_primes, cli.cols, shift_table);
+    state.checkpoint_interval = cli.checkpoint_interval;
+    state.set_progress_reporter(progress);
+
+    let checkpoint_path = cli.output_dir.join("checkpoint.json");
+    let backup_path = cli.output_dir.join("checkpoint.bak");
+    let resume_path = if checkpoint_path.exists() {
+        Some(checkpoint_path.as_path())
+    } else {
+        backup_path.exists().then_some(backup_path.as_path())
+    };
+    state
+        .set_shift_path_store(
+            &cli.output_dir.join("HLSearch.rocksdb"),
+            cli.depth,
+            resume_path.is_none(),
+        )
+        .map_err(|error| error.to_string())?;
+
+    let (completed, result) = match cli.mode {
+        SearchMode::Sequential => {
+            let completed = state
+                .search_with_checkpoint_interruptible(
+                    cli.depth,
+                    Some(&checkpoint_path),
+                    resume_path,
+                    &AtomicBool::new(false),
+                )
+                .map_err(|error| error.to_string())?;
+            (
+                completed,
+                OutputResult {
+                    max_score: state.max_score,
+                    results: state.results,
+                    shifts: state.shifts,
+                    target_count: state.target_count,
+                    target_shifts: state.target_shifts,
+                },
+            )
+        }
+        SearchMode::Parallel => {
+            let (result, completed) = state
+                .search_parallel_interruptible(
+                    cli.depth,
+                    Some(&checkpoint_path),
+                    resume_path,
+                    &AtomicBool::new(false),
+                )
+                .map_err(|error| error.to_string())?;
+            (
+                completed,
+                OutputResult {
+                    max_score: result.max_score,
+                    results: result.results,
+                    shifts: result.shifts,
+                    target_count: result.target_count,
+                    target_shifts: result.target_shifts,
+                },
+            )
+        }
+    };
+
+    if completed {
+        for filename in ["checkpoint.json", "checkpoint.bak"] {
+            let checkpoint_path = cli.output_dir.join(filename);
+            if checkpoint_path.exists() {
+                std::fs::remove_file(&checkpoint_path).map_err(|error| error.to_string())?;
+                info!("Removed completed search checkpoint: {}", checkpoint_path.display());
+            }
+        }
+    }
+
+    Ok(OutputFile {
+        config: OutputConfig {
+            mode: match cli.mode {
+                SearchMode::Sequential => "sequential",
+                SearchMode::Parallel => "parallel",
+            },
+            depth: cli.depth,
+            cols: cli.cols,
+            elapsed: format!("{:?}", start_time.elapsed()),
+        },
+        result,
+    })
+}
 fn show_search_tree(ui: &mut egui::Ui, nodes: &[TreeNode], max_score: usize) {
     let max_depth = nodes.iter().map(|node| node.depth).max().unwrap_or(0);
     let leaf_count = nodes
@@ -515,6 +534,18 @@ fn show_search_tree(ui: &mut egui::Ui, nodes: &[TreeNode], max_score: usize) {
 
 impl App for AppState {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if self
+            .search_thread
+            .as_ref()
+            .map(JoinHandle::is_finished)
+            .unwrap_or(false)
+        {
+            self.finish_search();
+        }
+        if self.is_searching {
+            ctx.request_repaint_after(Duration::from_millis(100));
+        }
+
         let mut search_requested = false;
         egui::TopBottomPanel::top("top_view")
             .default_height(60.0)
@@ -524,11 +555,13 @@ impl App for AppState {
                     ui.heading("TopView");
                     ui.separator();
                     ui.label("Depth");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.depth_input)
-                            .desired_width(80.0),
+                    ui.add_enabled(
+                        !self.is_searching,
+                        egui::TextEdit::singleline(&mut self.depth_input).desired_width(80.0),
                     );
-                    search_requested = ui.button("Search").clicked();
+                    search_requested = ui
+                        .add_enabled(!self.is_searching, egui::Button::new("Search"))
+                        .clicked();
                 });
                 if let Some(error) = &self.search_error {
                     ui.colored_label(egui::Color32::RED, error);
@@ -563,18 +596,30 @@ impl App for AppState {
             });
 
         if search_requested {
-            self.search_error = match self.depth_input.parse::<usize>() {
+            match self.depth_input.parse::<usize>() {
                 Ok(depth) => {
                     self.cli.depth = depth;
-                    self.run_search().err().map(|error| error.to_string())
+                    self.start_search();
                 }
-                Err(_) => Some("Depth must be a positive integer".to_string()),
-            };
+                Err(_) => self.search_error = Some("Depth must be a positive integer".to_string()),
+            }
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("MainView");
-            
+            if self.is_searching {
+                let progress = self.search_progress.snapshot();
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(format!(
+                        "Searching: nodes={} best={} hits={} depth={}",
+                        progress.node_count, progress.max_score, progress.results, progress.depth
+                    ));
+                });
+                ui.label(format!("Elapsed: {:?}", self.start_time.elapsed()));
+            }
+
             if let Some(result) = &self.search_results {
                 ui.separator();
                 ui.label(format!("Search Finished! Max Score: {}", result.result.max_score));
@@ -586,8 +631,10 @@ impl App for AppState {
                     self.search_tree.len().saturating_sub(1)
                 ));
                 show_search_tree(ui, &self.search_tree, result.result.max_score);
+            } else if !self.is_searching {
+                ui.label("Press 'Search' to begin visualization.");
             } else {
-                ui.label("Press 'Run Search' to begin visualization.");
+                ui.label("Search is running...");
             }
         });
     }
@@ -595,26 +642,17 @@ impl App for AppState {
 
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Setup initial state structure that can be passed to the GUI AppState
     let cli = Cli::parse();
 
-    // 1. Initialize a dummy/default AppState instance for eframe setup
-    let mut initial_state = AppState {
-        cli: cli.clone(),
-        state: State::new(generate_primes(MAX_PRIME), cli.cols, build_shift_table(&generate_primes(MAX_PRIME)[..cli.depth], cli.cols)), // Requires complex setup/refactoring here
-        start_time: Instant::now(),
-        search_results: None,
-        search_tree: Vec::new(),
-        depth_input: cli.depth.to_string(),
-        search_error: None,
-        log_entries: Arc::new(Mutex::new(VecDeque::new())),
-        show_visualization: true,
-    };
-
-    // 2. Setup logging and other initializations (kept for compatibility)
-    let log_entries = Arc::clone(&initial_state.log_entries);
+    std::fs::create_dir_all(&cli.output_dir)?;
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(cli.output_dir.join(LOG_FILENAME))?;
+    let log_entries = Arc::new(Mutex::new(VecDeque::new()));
     log::set_boxed_logger(Box::new(UiLogger {
         entries: Arc::clone(&log_entries),
+        writer: Mutex::new(BufWriter::new(log_file)),
     }))?;
     log::set_max_level(LevelFilter::Info);
     let interrupted = Arc::new(AtomicBool::new(false));
@@ -643,14 +681,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Box::new(move |_cc| {
             let app = AppState {
                 cli: cli.clone(),
-                state: State::new(generate_primes(MAX_PRIME), cli.cols, build_shift_table(&generate_primes(MAX_PRIME)[..cli.depth], cli.cols)), 
                 start_time: Instant::now(),
                 search_results: None,
                 search_tree: Vec::new(),
                 depth_input: cli.depth.to_string(),
                 search_error: None,
                 log_entries: Arc::clone(&log_entries),
-                show_visualization: true,
+                search_progress: Arc::new(SearchProgress::default()),
+                search_thread: None,
+                is_searching: false,
             };
             Box::new(app)
         }),
@@ -675,6 +714,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ui_logger_writes_entries_to_text_file() {
+        let path = std::env::temp_dir().join(format!(
+            "hlsearch-log-test-{}-{}.log",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let logger = UiLogger {
+            entries: Arc::new(Mutex::new(VecDeque::new())),
+            writer: Mutex::new(BufWriter::new(File::create(&path).unwrap())),
+        };
+        let record = log::Record::builder()
+            .args(format_args!("search started"))
+            .level(Level::Info)
+            .target("hlsearch")
+            .build();
+
+        logger.log(&record);
+        logger.flush();
+        drop(logger);
+
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "[INFO] search started\n"
+        );
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn search_tree_merges_shared_path_prefixes() {
