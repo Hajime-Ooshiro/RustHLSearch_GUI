@@ -1,7 +1,7 @@
 //! シフトパス木の RocksDB 永続化。
 //!
 //! - `nodes` CF:  key = node_id (u64 big-endian)
-//!                value = `{"parent_depth":..,"parent_node_id":..,"shift":..,"score":..}` (JSON)
+//!                value = `{"depth":..,"parent_depth":..,"parent_node_id":..,"shift":..,"score":..}` (JSON)
 //! - `node_index` CF: (parent_node_id, shift) -> node_id (重複ノード検出用の補助インデックス)
 //! - `target_paths` CF: (depth, target_shifts JSON) -> target_count
 //! - `meta` CF: 設定ハッシュ
@@ -30,6 +30,7 @@ type PendingAppends = Vec<(usize, Vec<usize>)>;
 /// `nodes` CF に JSON で保存されるノード情報
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeRecord {
+    pub depth: usize,
     pub parent_depth: usize,
     pub parent_node_id: Option<u64>,
     pub shift: usize,
@@ -181,6 +182,7 @@ impl ShiftPathStore {
                     touched.insert(
                         id,
                         NodeRecord {
+                            depth,
                             parent_depth: level,
                             parent_node_id,
                             shift,
@@ -436,6 +438,7 @@ mod tests {
             .map(|(_, record)| record)
             .collect();
         let record = |shift, score| NodeRecord {
+            depth: 2,
             parent_depth: 1,
             parent_node_id: Some(root_id),
             shift,
