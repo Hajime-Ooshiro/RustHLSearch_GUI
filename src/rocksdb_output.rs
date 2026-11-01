@@ -209,7 +209,11 @@ impl ShiftPathStore {
 
         let mut batch = WriteBatch::default();
         for (node_id, record) in &touched {
-            batch.put_cf(nodes_cf, node_id.to_be_bytes(), serde_json::to_vec(record).map_err(err)?);
+            batch.put_cf(
+                nodes_cf,
+                node_id.to_be_bytes(),
+                serde_json::to_vec(record).map_err(err)?,
+            );
         }
         for (key, node_id) in &new_index {
             batch.put_cf(index_cf, key, node_id.to_be_bytes());
@@ -243,6 +247,28 @@ impl ShiftPathStore {
         self.load_leaf_paths(depth, None)
     }
 
+    /// 指定深さの葉をスコア降順、同スコアでは node_id 昇順で最大 `limit` 件返す。
+    pub fn load_top_scored_paths(
+        &self,
+        depth: usize,
+        limit: usize,
+    ) -> Result<Vec<(usize, Vec<usize>)>, String> {
+        let mut leaves = self.load_nodes(depth)?;
+        leaves.sort_by(|(left_id, left), (right_id, right)| {
+            right
+                .score
+                .cmp(&left.score)
+                .then_with(|| left_id.cmp(right_id))
+        });
+        leaves.truncate(limit);
+        let scores: Vec<usize> = leaves.iter().map(|(_, record)| record.score).collect();
+        let paths = self.reconstruct_leaf_paths(
+            depth,
+            leaves.into_iter().map(|(_, record)| record).collect(),
+        )?;
+        Ok(scores.into_iter().zip(paths).collect())
+    }
+
     fn load_leaf_paths(
         &self,
         depth: usize,
@@ -258,7 +284,14 @@ impl ShiftPathStore {
             .map(|(_, record)| record)
             .filter(|record| max_count.is_none_or(|score| record.score == score))
             .collect();
+        self.reconstruct_leaf_paths(depth, leaves)
+    }
 
+    fn reconstruct_leaf_paths(
+        &self,
+        depth: usize,
+        leaves: Vec<NodeRecord>,
+    ) -> Result<Vec<Vec<usize>>, String> {
         let mut paths: Vec<Vec<usize>> = leaves.iter().map(|leaf| vec![leaf.shift]).collect();
         let mut parent_ids: Vec<Option<u64>> =
             leaves.iter().map(|leaf| leaf.parent_node_id).collect();
@@ -266,8 +299,8 @@ impl ShiftPathStore {
 
         for _ in 1..depth {
             for (path, parent_id) in paths.iter_mut().zip(parent_ids.iter_mut()) {
-                let node_id = parent_id
-                    .ok_or_else(|| format!("depth {depth} の親ノードが欠けています"))?;
+                let node_id =
+                    parent_id.ok_or_else(|| format!("depth {depth} の親ノードが欠けています"))?;
                 if !cache.contains_key(&node_id) {
                     let record = read_node(&self.db, node_id)?
                         .ok_or_else(|| format!("node_id {node_id} がありません"))?;
@@ -460,6 +493,28 @@ mod tests {
         assert_eq!(store.load_full_depth_paths(2).unwrap(), vec![vec![1, 2]]);
         assert_eq!(store.load_full_depth_paths(3).unwrap(), vec![vec![1, 2, 3]]);
         assert_eq!(store.load_result_paths(4).unwrap(), vec![vec![1, 2, 3]]);
+
+        drop(store);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn top_scored_paths_are_score_sorted_and_stable_for_ties() {
+        let path = database_path();
+        let store = ShiftPathStore::create(&path, 2, true, 12345).unwrap();
+        store
+            .append_batch(vec![
+                (7, vec![1, 2]),
+                (9, vec![0, 1]),
+                (9, vec![0, 2]),
+                (8, vec![1, 0]),
+            ])
+            .unwrap();
+
+        assert_eq!(
+            store.load_top_scored_paths(2, 3).unwrap(),
+            vec![(9, vec![0, 1]), (9, vec![0, 2]), (8, vec![1, 0])]
+        );
 
         drop(store);
         std::fs::remove_dir_all(path).unwrap();

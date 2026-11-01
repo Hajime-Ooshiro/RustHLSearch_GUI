@@ -1,10 +1,11 @@
 mod bitmask;
 mod output;
 mod primes;
-mod search;
 mod rocksdb_output;
+mod search;
 
 use clap::Parser;
+use eframe::{egui, App, Frame};
 use log::{info, Level, LevelFilter, Log, Metadata, Record};
 use output::with_timestamp;
 use primes::{generate_primes, MAX_PRIME};
@@ -18,7 +19,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
-use eframe::{egui, App, Frame};
 
 const CHECKPOINT_FILENAME: &str = "checkpoint.json";
 const CHECKPOINT_BACKUP_FILENAME: &str = "checkpoint.bak";
@@ -83,6 +83,7 @@ struct OutputResult {
     max_score: usize,
     results: usize,
     shifts: Vec<Vec<usize>>,
+    path_scores: Vec<usize>,
     target_count: usize,
     target_shifts: Vec<Vec<usize>>,
 }
@@ -288,21 +289,23 @@ struct TreeNode {
     shift: Option<usize>,
     parent: Option<usize>,
     depth: usize,
+    score: Option<usize>,
     children: Vec<usize>,
     y: f32,
 }
 
-fn build_search_tree(paths: &[Vec<usize>]) -> Vec<TreeNode> {
+fn build_search_tree(paths: &[Vec<usize>], path_scores: &[usize]) -> Vec<TreeNode> {
     let mut nodes = vec![TreeNode {
         shift: None,
         parent: None,
         depth: 0,
+        score: None,
         children: Vec::new(),
         y: 0.0,
     }];
     let mut child_indices = HashMap::new();
 
-    for path in paths {
+    for (path_index, path) in paths.iter().enumerate() {
         let mut parent = 0;
         for (depth, &shift) in path.iter().enumerate() {
             let key = (parent, shift);
@@ -312,12 +315,16 @@ fn build_search_tree(paths: &[Vec<usize>]) -> Vec<TreeNode> {
                     shift: Some(shift),
                     parent: Some(parent),
                     depth: depth + 1,
+                    score: None,
                     children: Vec::new(),
                     y: 0.0,
                 });
                 nodes[parent].children.push(child);
                 child
             });
+            if depth + 1 == path.len() {
+                nodes[child].score = path_scores.get(path_index).copied();
+            }
             parent = child;
         }
     }
@@ -369,7 +376,8 @@ impl AppState {
         self.is_searching = false;
         match search_thread.join() {
             Ok(Ok(result)) => {
-                self.search_tree = build_search_tree(&result.result.shifts);
+                self.search_tree =
+                    build_search_tree(&result.result.shifts, &result.result.path_scores);
                 self.search_results = Some(result);
             }
             Ok(Err(error)) => self.search_error = Some(error),
@@ -407,6 +415,60 @@ fn run_search(
         )
         .map_err(|error| error.to_string())?;
 
+    let stored_records = state
+        .load_top_scored_paths(cli.depth, 100)
+        .map_err(|error| error.to_string())?;
+    if !stored_records.is_empty() {
+        let (path_scores, shifts): (Vec<_>, Vec<_>) = stored_records.into_iter().unzip();
+        let max_score = path_scores[0];
+        info!(
+            "Displaying {} saved depth {} records ordered by score descending and node ID ascending",
+            shifts.len(),
+            cli.depth
+        );
+        return Ok(OutputFile {
+            config: OutputConfig {
+                mode: match cli.mode {
+                    SearchMode::Sequential => "sequential",
+                    SearchMode::Parallel => "parallel",
+                },
+                depth: cli.depth,
+                cols: cli.cols,
+                elapsed: format!("{:?}", start_time.elapsed()),
+            },
+            result: OutputResult {
+                max_score,
+                results: shifts.len(),
+                shifts,
+                path_scores,
+                target_count: 0,
+                target_shifts: Vec::new(),
+            },
+        });
+    }
+
+    if cli.depth == 1
+        || state
+            .load_top_scored_paths(cli.depth - 1, 1)
+            .map_err(|error| error.to_string())?
+            .is_empty()
+    {
+        return Err(format!(
+            "No records exist for depth {}{}",
+            cli.depth,
+            if cli.depth > 1 {
+                format!(" or depth {}", cli.depth - 1)
+            } else {
+                String::new()
+            }
+        ));
+    }
+    info!(
+        "No saved depth {} records; starting beam search from saved depth {} records",
+        cli.depth,
+        cli.depth - 1
+    );
+
     let (completed, result) = match cli.mode {
         SearchMode::Sequential => {
             let completed = state
@@ -422,6 +484,7 @@ fn run_search(
                 OutputResult {
                     max_score: state.max_score,
                     results: state.results,
+                    path_scores: vec![state.max_score; state.shifts.len()],
                     shifts: state.shifts,
                     target_count: state.target_count,
                     target_shifts: state.target_shifts,
@@ -442,6 +505,7 @@ fn run_search(
                 OutputResult {
                     max_score: result.max_score,
                     results: result.results,
+                    path_scores: vec![result.max_score; result.shifts.len()],
                     shifts: result.shifts,
                     target_count: result.target_count,
                     target_shifts: result.target_shifts,
@@ -455,7 +519,10 @@ fn run_search(
             let checkpoint_path = cli.output_dir.join(filename);
             if checkpoint_path.exists() {
                 std::fs::remove_file(&checkpoint_path).map_err(|error| error.to_string())?;
-                info!("Removed completed search checkpoint: {}", checkpoint_path.display());
+                info!(
+                    "Removed completed search checkpoint: {}",
+                    checkpoint_path.display()
+                );
             }
         }
     }
@@ -473,7 +540,7 @@ fn run_search(
         result,
     })
 }
-fn show_search_tree(ui: &mut egui::Ui, nodes: &[TreeNode], max_score: usize) {
+fn show_search_tree(ui: &mut egui::Ui, nodes: &[TreeNode]) {
     let max_depth = nodes.iter().map(|node| node.depth).max().unwrap_or(0);
     let leaf_count = nodes
         .iter()
@@ -500,10 +567,7 @@ fn show_search_tree(ui: &mut egui::Ui, nodes: &[TreeNode], max_score: usize) {
                                 x_for_depth(nodes[parent].depth) + 9.0,
                                 rect.top() + nodes[parent].y,
                             ),
-                            egui::pos2(
-                                x_for_depth(node.depth) - 9.0,
-                                rect.top() + node.y,
-                            ),
+                            egui::pos2(x_for_depth(node.depth) - 9.0, rect.top() + node.y),
                         ],
                         egui::Stroke::new(1.0_f32, egui::Color32::from_gray(110)),
                     );
@@ -514,9 +578,10 @@ fn show_search_tree(ui: &mut egui::Ui, nodes: &[TreeNode], max_score: usize) {
                 let center = egui::pos2(x_for_depth(node.depth), rect.top() + node.y);
                 painter.circle_filled(center, 8.0, egui::Color32::from_rgb(70, 145, 220));
                 let label = match node.shift {
-                    Some(shift) if node.children.is_empty() => {
-                        format!("shift {shift} (score {max_score})")
-                    }
+                    Some(shift) if node.children.is_empty() => match node.score {
+                        Some(score) => format!("shift {shift} (score {score})"),
+                        None => format!("shift {shift}"),
+                    },
                     Some(shift) => format!("shift {shift}"),
                     None => "Start".to_string(),
                 };
@@ -530,7 +595,6 @@ fn show_search_tree(ui: &mut egui::Ui, nodes: &[TreeNode], max_score: usize) {
             }
         });
 }
-
 
 impl App for AppState {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
@@ -622,15 +686,18 @@ impl App for AppState {
 
             if let Some(result) = &self.search_results {
                 ui.separator();
-                ui.label(format!("Search Finished! Max Score: {}", result.result.max_score));
+                ui.label(format!(
+                    "Search Finished! Max Score: {}",
+                    result.result.max_score
+                ));
 
                 ui.add_space(10.0);
                 ui.label(format!(
-                    "Best-score paths: {} ({} tree nodes)",
+                    "Displayed paths: {} ({} tree nodes)",
                     result.result.shifts.len(),
                     self.search_tree.len().saturating_sub(1)
                 ));
-                show_search_tree(ui, &self.search_tree, result.result.max_score);
+                show_search_tree(ui, &self.search_tree);
             } else if !self.is_searching {
                 ui.label("Press 'Search' to begin visualization.");
             } else {
@@ -639,7 +706,6 @@ impl App for AppState {
         });
     }
 }
-
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
@@ -663,17 +729,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         })?;
     }
 
-
     // 3. Run the GUI application instead of exiting CLI style
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_inner_size([1200.0, 800.0]),
         ..Default::default()
     };
 
-    // Note: Due to the massive structural change required, I cannot reliably replace the entire execution path below 
+    // Note: Due to the massive structural change required, I cannot reliably replace the entire execution path below
     // with a simple call because the search logic depends heavily on CLI arguments and exiting state cleanup.
     // The user must adapt `AppState::run_search` and the initialization above carefully.
-    
+
     // For now, we provide the eframe run loop structure:
     eframe::run_native(
         "HLSearch Visualizer",
@@ -693,16 +758,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             Box::new(app)
         }),
-    ).map_err(|e| {
+    )
+    .map_err(|e| {
         std::io::Error::new(
             std::io::ErrorKind::Other,
             format!("Failed to run eframe: {}", e),
         )
     })?;
 
-
     // If the user still prefers CLI output fallback (for testing/non-GUI use):
-    /* 
+    /*
     if initial_state.search_results.is_some() {
         println!("\n--- GUI mode skipped. Displaying structured result (Fallback) ---");
         // Logic to write results...
@@ -748,13 +813,14 @@ mod tests {
 
     #[test]
     fn search_tree_merges_shared_path_prefixes() {
-        let tree = build_search_tree(&[vec![2, 1], vec![2, 0], vec![1, 1]]);
+        let tree = build_search_tree(&[vec![2, 1], vec![2, 0], vec![1, 1]], &[9, 8, 7]);
 
         assert_eq!(tree.len(), 6);
         assert_eq!(tree[0].children.len(), 2);
         assert_eq!(tree[1].shift, Some(2));
         assert_eq!(tree[1].children.len(), 2);
         assert_eq!(tree[1].parent, Some(0));
+        assert_eq!(tree[2].score, Some(9));
     }
 
     fn test_cli() -> Cli {
@@ -808,6 +874,7 @@ mod tests {
             max_score: 447,
             results: 1,
             shifts: vec![vec![1, 1, 4]],
+            path_scores: vec![447],
             target_count: 0,
             target_shifts: Vec::new(),
         })

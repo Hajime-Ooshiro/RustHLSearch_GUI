@@ -313,6 +313,17 @@ impl State {
         self.progress_bar = Some(progress_bar);
     }
 
+    pub fn load_top_scored_paths(
+        &self,
+        depth: usize,
+        limit: usize,
+    ) -> Result<Vec<(usize, Vec<usize>)>, String> {
+        match &self.shift_path_store {
+            Some(store) => store.load_top_scored_paths(depth, limit),
+            None => Ok(Vec::new()),
+        }
+    }
+
     pub fn finish_progress(&self, completed: bool) {
         let Some(progress_bar) = &self.progress_bar else {
             return;
@@ -1839,6 +1850,40 @@ mod tests {
         let _ = std::fs::remove_file(checkpoint_path);
         let _ = std::fs::remove_file(backup_path);
         drop(resumed);
+        std::fs::remove_dir_all(database_path).unwrap();
+    }
+
+    #[test]
+    fn beam_search_is_seeded_only_from_previous_depth_records() {
+        let primes = vec![2, 3];
+        let cols = 4;
+        let table = build_shift_table(&primes, cols);
+        let database_path =
+            unique_checkpoint_path("beam-seeded-from-previous-depth").with_extension("rocksdb");
+
+        let mut previous = State::new(primes.clone(), cols, table.clone());
+        previous
+            .set_shift_path_store(&database_path, 1, true)
+            .unwrap();
+        previous
+            .shift_path_store
+            .as_ref()
+            .unwrap()
+            .append(2, &[1])
+            .unwrap();
+        drop(previous);
+
+        let mut state = State::new(primes, cols, table);
+        state.target = 0;
+        state
+            .set_shift_path_store(&database_path, 2, false)
+            .unwrap();
+        let result = state.search_parallel(2, None, None).unwrap();
+
+        assert_eq!(result.node_count, 3);
+        assert!(result.shifts.iter().all(|path| path[0] == 1));
+
+        drop(state);
         std::fs::remove_dir_all(database_path).unwrap();
     }
 
