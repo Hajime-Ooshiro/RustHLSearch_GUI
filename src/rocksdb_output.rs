@@ -121,6 +121,7 @@ impl ShiftPathStore {
         })
     }
 
+    #[allow(dead_code)] // Convenience API; some callers use append_batch directly.
     pub fn append(&self, max_count: usize, path: &[usize]) -> Result<(), String> {
         if path.is_empty() {
             return Ok(());
@@ -239,6 +240,7 @@ impl ShiftPathStore {
         Ok(())
     }
 
+    #[allow(dead_code)] // Optional result-loading API.
     pub fn load_result_paths(&self, max_count: usize) -> Result<Vec<Vec<usize>>, String> {
         self.load_leaf_paths(self.depth, Some(max_count))
     }
@@ -340,6 +342,7 @@ impl ShiftPathStore {
         Ok(nodes)
     }
 
+    #[allow(dead_code)] // Optional target-loading API.
     pub fn load_target_paths(&self) -> Result<Vec<Vec<usize>>, String> {
         self.flush()?;
         let targets_cf = cf(&self.db, CF_TARGETS)?;

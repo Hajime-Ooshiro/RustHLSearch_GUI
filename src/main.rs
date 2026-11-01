@@ -5,9 +5,8 @@ mod rocksdb_output;
 mod search;
 
 use clap::Parser;
-use eframe::{egui, App, Frame};
+use eframe::{egui, App};
 use log::{info, Level, LevelFilter, Log, Metadata, Record};
-use output::with_timestamp;
 use primes::{generate_primes, MAX_PRIME};
 use search::{build_shift_table, SearchMode, SearchProgress, State};
 use serde::Serialize;
@@ -400,8 +399,8 @@ fn run_search(
     state.checkpoint_interval = cli.checkpoint_interval;
     state.set_progress_reporter(progress);
 
-    let checkpoint_path = cli.output_dir.join("checkpoint.json");
-    let backup_path = cli.output_dir.join("checkpoint.bak");
+    let checkpoint_path = cli.output_dir.join(CHECKPOINT_FILENAME);
+    let backup_path = cli.output_dir.join(CHECKPOINT_BACKUP_FILENAME);
     let resume_path = if checkpoint_path.exists() {
         Some(checkpoint_path.as_path())
     } else {
@@ -447,8 +446,8 @@ fn run_search(
         });
     }
 
-    if cli.depth == 1
-        || state
+    if cli.depth > 1
+        && state
             .load_top_scored_paths(cli.depth - 1, 1)
             .map_err(|error| error.to_string())?
             .is_empty()
@@ -463,11 +462,15 @@ fn run_search(
             }
         ));
     }
-    info!(
-        "No saved depth {} records; starting beam search from saved depth {} records",
-        cli.depth,
-        cli.depth - 1
-    );
+    if cli.depth > 1 {
+        info!(
+            "No saved depth {} records; starting beam search from saved depth {} records",
+            cli.depth,
+            cli.depth - 1
+        );
+    } else {
+        info!("No saved depth 1 records; starting search from the root");
+    }
 
     let (completed, result) = match cli.mode {
         SearchMode::Sequential => {
@@ -515,7 +518,7 @@ fn run_search(
     };
 
     if completed {
-        for filename in ["checkpoint.json", "checkpoint.bak"] {
+        for filename in [CHECKPOINT_FILENAME, CHECKPOINT_BACKUP_FILENAME] {
             let checkpoint_path = cli.output_dir.join(filename);
             if checkpoint_path.exists() {
                 std::fs::remove_file(&checkpoint_path).map_err(|error| error.to_string())?;
@@ -866,6 +869,26 @@ mod tests {
             cli.validate(3).unwrap_err(),
             "depth (4) cannot exceed available primes (3)"
         );
+    }
+
+    #[test]
+    fn search_runs_when_depth_one_has_no_saved_records() {
+        let output_dir = std::env::temp_dir().join(format!(
+            "hlsearch-depth-one-search-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&output_dir).unwrap();
+        let mut cli = test_cli();
+        cli.output_dir = output_dir.clone();
+
+        let result = run_search(cli, Arc::new(SearchProgress::default()), Instant::now());
+
+        assert!(result.is_ok());
+        std::fs::remove_dir_all(output_dir).unwrap();
     }
 
     #[test]

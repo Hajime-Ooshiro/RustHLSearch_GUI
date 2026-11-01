@@ -2,6 +2,7 @@ use chrono::Local;
 use std::path::{Path, PathBuf};
 
 /// 出力ファイルパスに深さとタイムスタンプ (YYYYMMDD_HHMMSS) を挿入する
+#[allow(dead_code)]
 pub fn with_timestamp(path: &Path, depth: usize) -> PathBuf {
     let timestamp = Local::now().format("%Y%m%d_%H%M%S").to_string();
 
