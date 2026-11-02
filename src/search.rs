@@ -1,6 +1,7 @@
 use crate::bitmask::BitMask;
 use crate::rocksdb_output::ShiftPathStore;
 use log::{debug, info};
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
@@ -258,6 +259,66 @@ impl State {
             })
             .collect();
         Ok(candidates)
+    }
+
+    fn persist_candidates(&self, candidates: &[BeamCandidate]) -> Result<(), String> {
+        let Some(store) = &self.shift_path_store else {
+            return Ok(());
+        };
+        for batch in candidates.chunks(SHIFT_PATH_BATCH_SIZE) {
+            store.append_batch(
+                batch
+                    .iter()
+                    .map(|candidate| (candidate.score, candidate.key.clone()))
+                    .collect(),
+            )?;
+        }
+        store.flush()
+    }
+
+    fn evaluate_frontier_parallel(
+        &self,
+        frontier: &[BeamCandidate],
+        level: usize,
+        interrupted: &AtomicBool,
+    ) -> Option<(u64, Vec<BeamCandidate>)> {
+        let evaluated: Vec<_> = frontier
+            .par_iter()
+            .map(|candidate| {
+                if interrupted.load(Ordering::SeqCst) {
+                    return (0, Vec::new());
+                }
+
+                let base_mask = self.rebuild_masks(level, &candidate.key)[level].clone();
+                let mut candidates = Vec::new();
+                let mut nodes = 0;
+                for shift in (0..self.primes[level]).rev() {
+                    if interrupted.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    let mut mask = self.zero_mask.clone();
+                    let score = mask.bitand_into_count(&base_mask, &self.shift_table[level][shift]);
+                    nodes += 1;
+                    if score >= self.target {
+                        let mut key = candidate.key.clone();
+                        key.push(shift);
+                        candidates.push(BeamCandidate { key, score });
+                    }
+                }
+                (nodes, candidates)
+            })
+            .collect();
+
+        if interrupted.load(Ordering::SeqCst) {
+            return None;
+        }
+
+        let node_count = evaluated.iter().map(|(nodes, _)| *nodes).sum();
+        let candidates = evaluated
+            .into_iter()
+            .flat_map(|(_, candidates)| candidates)
+            .collect();
+        Some((node_count, candidates))
     }
 
     fn aggregate_leaf_result(&mut self, score: usize, key: &[usize]) -> Result<(), String> {
@@ -695,13 +756,158 @@ impl State {
         resume_path: Option<&Path>,
         interrupted: &AtomicBool,
     ) -> Result<(SharedResults, bool), Box<dyn std::error::Error>> {
-        self.search_beam_interruptible(
-            depth,
-            checkpoint_path,
-            resume_path,
-            interrupted,
-            SearchMode::Parallel,
-        )
+        let (mut frontier, mut level) = if let Some(path) = resume_path {
+            let checkpoint = Self::load_checkpoint(path)?;
+            if checkpoint.mode != SearchMode::Parallel {
+                return Err(format!(
+                    "{:?} mode checkpoint can only be resumed with --mode parallel",
+                    checkpoint.mode
+                )
+                .into());
+            }
+            self.apply_checkpoint_config(&checkpoint, depth)?;
+            self.node_count = checkpoint.node_count;
+            (
+                checkpoint.beam_frontier.ok_or(
+                    "Checkpoint predates beam search and cannot be resumed; use a different --output-dir",
+                )?,
+                checkpoint.beam_level,
+            )
+        } else if let Some(paths) = self.load_previous_depth_paths(depth)? {
+            (
+                paths
+                    .into_iter()
+                    .filter_map(|key| {
+                        let score = self.rebuild_masks(depth, &key)[key.len()].count_ones();
+                        (score >= self.target).then_some(BeamCandidate { key, score })
+                    })
+                    .collect(),
+                depth - 1,
+            )
+        } else {
+            (
+                vec![BeamCandidate {
+                    key: Vec::new(),
+                    score: self.zero_mask.count_ones(),
+                }],
+                0,
+            )
+        };
+
+        self.max_score = 0;
+        self.results = 0;
+        self.shifts.clear();
+        self.target_count = 0;
+        self.target_shifts.clear();
+        let mut next_checkpoint = self.node_count.saturating_add(self.checkpoint_interval);
+
+        loop {
+            if interrupted.load(Ordering::SeqCst) {
+                self.write_beam_checkpoint(
+                    checkpoint_path,
+                    SearchMode::Parallel,
+                    depth,
+                    &frontier,
+                    level,
+                    Vec::new(),
+                    0,
+                    0,
+                )?;
+                return Ok((SharedResults::default(), false));
+            }
+
+            if level == depth {
+                for candidate in &frontier {
+                    self.aggregate_target_result(depth, candidate.score, &candidate.key)
+                        .map_err(std::io::Error::other)?;
+                    self.aggregate_leaf_result(candidate.score, &candidate.key)
+                        .map_err(std::io::Error::other)?;
+                }
+                if let Some(store) = &self.shift_path_store {
+                    store.flush().map_err(std::io::Error::other)?;
+                }
+                let results = SharedResults {
+                    max_score: self.max_score,
+                    results: self.results,
+                    shifts: self.shifts.clone(),
+                    target_count: self.target_count,
+                    target_shifts: self.target_shifts.clone(),
+                };
+                self.write_beam_checkpoint(
+                    checkpoint_path,
+                    SearchMode::Parallel,
+                    depth,
+                    &frontier,
+                    level,
+                    Vec::new(),
+                    0,
+                    0,
+                )?;
+                return Ok((results, true));
+            }
+
+            let Some((nodes, candidates)) =
+                self.evaluate_frontier_parallel(&frontier, level, interrupted)
+            else {
+                self.write_beam_checkpoint(
+                    checkpoint_path,
+                    SearchMode::Parallel,
+                    depth,
+                    &frontier,
+                    level,
+                    Vec::new(),
+                    0,
+                    0,
+                )?;
+                return Ok((SharedResults::default(), false));
+            };
+            self.node_count += nodes;
+            self.persist_candidates(&candidates)
+                .map_err(std::io::Error::other)?;
+
+            level += 1;
+            frontier = if self.shift_path_store.is_some() {
+                self.load_candidates_from_store(level)
+                    .map_err(std::io::Error::other)?
+            } else {
+                candidates
+            };
+
+            Self::update_progress(
+                self.progress_reporter.as_deref(),
+                self.node_count,
+                self.max_score,
+                self.results,
+                level,
+            );
+            if self.node_count >= next_checkpoint {
+                self.write_beam_checkpoint(
+                    checkpoint_path,
+                    SearchMode::Parallel,
+                    depth,
+                    &frontier,
+                    level,
+                    Vec::new(),
+                    0,
+                    0,
+                )?;
+                next_checkpoint = self.node_count.saturating_add(self.checkpoint_interval);
+            }
+
+            if frontier.is_empty() {
+                self.write_beam_checkpoint(
+                    checkpoint_path,
+                    SearchMode::Parallel,
+                    depth,
+                    &frontier,
+                    level,
+                    Vec::new(),
+                    0,
+                    0,
+                )?;
+                return Ok((SharedResults::default(), true));
+            }
+        }
     }
 }
 
