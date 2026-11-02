@@ -249,6 +249,49 @@ impl ShiftPathStore {
         self.load_leaf_paths(depth, None)
     }
 
+    /// 指定深さの葉を node_id 順に最大 `limit` 件返す。
+    ///
+    /// `after_node_id` を指定した場合は、その直後のノードから読み始める。
+    pub fn load_full_depth_paths_batch(
+        &self,
+        depth: usize,
+        after_node_id: Option<u64>,
+        limit: usize,
+    ) -> Result<Vec<(u64, Vec<usize>)>, String> {
+        self.flush()?;
+        if depth == 0 || depth > MAX_DEPTH || limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let nodes_cf = cf(&self.db, CF_NODES)?;
+        let start_node_id = after_node_id.unwrap_or_else(|| make_node_id(depth, 0));
+        let start = start_node_id.to_be_bytes();
+        let mut leaf_ids = Vec::with_capacity(limit);
+        let mut leaves = Vec::with_capacity(limit);
+        for item in self
+            .db
+            .iterator_cf(nodes_cf, IteratorMode::From(&start, Direction::Forward))
+        {
+            let (key, value) = item.map_err(err)?;
+            let node_id = decode_u64(&key)?;
+            if node_depth(node_id) != depth {
+                break;
+            }
+            if after_node_id.is_some_and(|after| node_id <= after) {
+                continue;
+            }
+
+            leaf_ids.push(node_id);
+            leaves.push(serde_json::from_slice(&value).map_err(err)?);
+            if leaves.len() == limit {
+                break;
+            }
+        }
+
+        let paths = self.reconstruct_leaf_paths(depth, leaves)?;
+        Ok(leaf_ids.into_iter().zip(paths).collect())
+    }
+
     /// 指定深さの葉をスコア降順、同スコアでは node_id 昇順で最大 `limit` 件返す。
     pub fn load_top_scored_paths(
         &self,
@@ -518,6 +561,33 @@ mod tests {
             store.load_top_scored_paths(2, 3).unwrap(),
             vec![(9, vec![0, 1]), (9, vec![0, 2]), (8, vec![1, 0])]
         );
+
+        drop(store);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn loads_full_depth_paths_in_node_id_batches() {
+        let path = database_path();
+        let store = ShiftPathStore::create(&path, 1, true, 12345).unwrap();
+        store
+            .append_batch((0..501).map(|shift| (1, vec![shift])).collect())
+            .unwrap();
+
+        let first = store.load_full_depth_paths_batch(1, None, 500).unwrap();
+        assert_eq!(first.len(), 500);
+        assert_eq!(first[0].1, vec![0]);
+        assert_eq!(first[499].1, vec![499]);
+
+        let second = store
+            .load_full_depth_paths_batch(1, Some(first[499].0), 500)
+            .unwrap();
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].1, vec![500]);
+        assert!(store
+            .load_full_depth_paths_batch(1, Some(second[0].0), 500)
+            .unwrap()
+            .is_empty());
 
         drop(store);
         std::fs::remove_dir_all(path).unwrap();

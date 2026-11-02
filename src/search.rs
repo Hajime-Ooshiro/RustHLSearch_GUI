@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 const SHIFT_PATH_BATCH_SIZE: usize = 256;
+const PREVIOUS_DEPTH_BATCH_SIZE: usize = 500;
 const BEAM_POLICY_VERSION: u64 = 2;
 
 /// 基底行の生成と補集合シフトテーブルの作成
@@ -90,6 +91,8 @@ struct Checkpoint {
     beam_next_index: usize,
     #[serde(default)]
     beam_next_shift: usize,
+    #[serde(default)]
+    beam_saved_prefix_batches: bool,
 }
 
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, clap::ValueEnum, Deserialize, Serialize)]
@@ -229,20 +232,16 @@ impl State {
         Ok(())
     }
 
-    fn load_previous_depth_paths(
-        &self,
-        depth: usize,
-    ) -> Result<Option<ShiftPaths>, Box<dyn std::error::Error>> {
+    fn has_previous_depth_paths(&self, depth: usize) -> Result<bool, String> {
         if depth == 0 {
-            return Ok(None);
+            return Ok(false);
         }
         let Some(store) = self.shift_path_store.as_ref() else {
-            return Ok(None);
+            return Ok(false);
         };
-        let paths = store
-            .load_full_depth_paths(depth - 1)
-            .map_err(std::io::Error::other)?;
-        Ok((!paths.is_empty()).then_some(paths))
+        Ok(!store
+            .load_full_depth_paths_batch(depth - 1, None, 1)?
+            .is_empty())
     }
 
     fn load_candidates_from_store(&self, depth: usize) -> Result<Vec<BeamCandidate>, String> {
@@ -356,6 +355,117 @@ impl State {
         Ok(())
     }
 
+    fn search_saved_prefix_batches(
+        &mut self,
+        depth: usize,
+        checkpoint_path: Option<&Path>,
+        interrupted: &AtomicBool,
+        mode: SearchMode,
+    ) -> Result<(SharedResults, bool), Box<dyn std::error::Error>> {
+        let store = self
+            .shift_path_store
+            .as_ref()
+            .cloned()
+            .ok_or("RocksDB output is not configured")?;
+        let mut after_node_id = None;
+        let mut pending_appends = Vec::with_capacity(SHIFT_PATH_BATCH_SIZE);
+
+        self.max_score = 0;
+        self.results = 0;
+        self.shifts.clear();
+        self.target_count = 0;
+        self.target_shifts.clear();
+
+        loop {
+            if interrupted.load(Ordering::SeqCst) {
+                self.submit_shift_path_batch(&mut pending_appends)
+                    .map_err(std::io::Error::other)?;
+                store.flush().map_err(std::io::Error::other)?;
+                self.write_saved_prefix_batch_checkpoint(checkpoint_path, mode, depth)?;
+                return Ok((SharedResults::default(), false));
+            }
+
+            let batch = store
+                .load_full_depth_paths_batch(depth - 1, after_node_id, PREVIOUS_DEPTH_BATCH_SIZE)
+                .map_err(std::io::Error::other)?;
+            let Some((last_node_id, _)) = batch.last() else {
+                store.flush().map_err(std::io::Error::other)?;
+                self.write_saved_prefix_batch_checkpoint(checkpoint_path, mode, depth)?;
+                return Ok((
+                    SharedResults {
+                        max_score: self.max_score,
+                        results: self.results,
+                        shifts: self.shifts.clone(),
+                        target_count: self.target_count,
+                        target_shifts: self.target_shifts.clone(),
+                    },
+                    true,
+                ));
+            };
+            after_node_id = Some(*last_node_id);
+
+            let frontier: Vec<_> = batch
+                .into_iter()
+                .filter_map(|(_, key)| {
+                    let score = self.rebuild_masks(depth, &key)[key.len()].count_ones();
+                    (score >= self.target).then_some(BeamCandidate { key, score })
+                })
+                .collect();
+            let candidates = match mode {
+                SearchMode::Sequential => {
+                    let mut candidates = Vec::new();
+                    for candidate in &frontier {
+                        let base_mask =
+                            self.rebuild_masks(depth, &candidate.key)[depth - 1].clone();
+                        for shift in (0..self.primes[depth - 1]).rev() {
+                            if interrupted.load(Ordering::SeqCst) {
+                                break;
+                            }
+                            let mut mask = self.zero_mask.clone();
+                            let score = mask
+                                .bitand_into_count(&base_mask, &self.shift_table[depth - 1][shift]);
+                            self.node_count += 1;
+                            if score >= self.target {
+                                let mut key = candidate.key.clone();
+                                key.push(shift);
+                                candidates.push(BeamCandidate { key, score });
+                            }
+                        }
+                    }
+                    candidates
+                }
+                SearchMode::Parallel => {
+                    let Some((nodes, candidates)) =
+                        self.evaluate_frontier_parallel(&frontier, depth - 1, interrupted)
+                    else {
+                        self.submit_shift_path_batch(&mut pending_appends)
+                            .map_err(std::io::Error::other)?;
+                        store.flush().map_err(std::io::Error::other)?;
+                        self.write_saved_prefix_batch_checkpoint(checkpoint_path, mode, depth)?;
+                        return Ok((SharedResults::default(), false));
+                    };
+                    self.node_count += nodes;
+                    candidates
+                }
+            };
+
+            for candidate in candidates {
+                self.aggregate_target_result(depth, candidate.score, &candidate.key)
+                    .map_err(std::io::Error::other)?;
+                self.aggregate_leaf_result(candidate.score, &candidate.key)
+                    .map_err(std::io::Error::other)?;
+                pending_appends.push((candidate.score, candidate.key));
+                if pending_appends.len() == SHIFT_PATH_BATCH_SIZE {
+                    self.submit_shift_path_batch(&mut pending_appends)
+                        .map_err(std::io::Error::other)?;
+                }
+            }
+            self.submit_shift_path_batch(&mut pending_appends)
+                .map_err(std::io::Error::other)?;
+            store.flush().map_err(std::io::Error::other)?;
+        }
+    }
+
     #[cfg(test)]
     pub fn search_with_checkpoint(
         &mut self,
@@ -398,6 +508,31 @@ impl State {
         interrupted: &AtomicBool,
         mode: SearchMode,
     ) -> Result<(SharedResults, bool), Box<dyn std::error::Error>> {
+        if let Some(path) = resume_path {
+            let checkpoint = Self::load_checkpoint(path)?;
+            if checkpoint.mode != mode {
+                return Err(format!(
+                    "{:?} mode checkpoint can only be resumed with --mode {}",
+                    checkpoint.mode,
+                    match checkpoint.mode {
+                        SearchMode::Sequential => "sequential",
+                        SearchMode::Parallel => "parallel",
+                    }
+                )
+                .into());
+            }
+            self.apply_checkpoint_config(&checkpoint, depth)?;
+            if checkpoint.beam_saved_prefix_batches {
+                return self.search_saved_prefix_batches(depth, checkpoint_path, interrupted, mode);
+            }
+        } else if depth > 1
+            && self
+                .has_previous_depth_paths(depth)
+                .map_err(std::io::Error::other)?
+        {
+            return self.search_saved_prefix_batches(depth, checkpoint_path, interrupted, mode);
+        }
+
         let (mut frontier, mut level, next_frontier, mut next_index, mut next_shift) = if let Some(
             path,
         ) =
@@ -434,15 +569,6 @@ impl State {
                 checkpoint.beam_next_index,
                 checkpoint.beam_next_shift,
             )
-        } else if let Some(paths) = self.load_previous_depth_paths(depth)? {
-            let candidates = paths
-                .into_iter()
-                .filter_map(|key| {
-                    let score = self.rebuild_masks(depth, &key)[key.len()].count_ones();
-                    (score >= self.target).then_some(BeamCandidate { key, score })
-                })
-                .collect();
-            (candidates, depth - 1, Vec::new(), 0, 0)
         } else {
             (
                 vec![BeamCandidate {
@@ -655,6 +781,43 @@ impl State {
                 beam_next_frontier: next_frontier,
                 beam_next_index: next_index,
                 beam_next_shift: next_shift,
+                beam_saved_prefix_batches: false,
+            },
+        )
+    }
+
+    fn write_saved_prefix_batch_checkpoint(
+        &self,
+        path: Option<&Path>,
+        mode: SearchMode,
+        depth: usize,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(path) = path else {
+            return Ok(());
+        };
+        self.write_checkpoint_file(
+            path,
+            &Checkpoint {
+                key: Vec::new(),
+                mode,
+                depth,
+                stack: Vec::new(),
+                max_score: 0,
+                results: 0,
+                target_count: 0,
+                node_count: 0,
+                split_depth: 0,
+                completed: Vec::new(),
+                in_progress: Vec::new(),
+                pending_prefixes: Vec::new(),
+                work_prefixes: None,
+                config_hash: self.compute_config_hash(),
+                beam_frontier: Some(Vec::new()),
+                beam_level: 0,
+                beam_next_frontier: Vec::new(),
+                beam_next_index: 0,
+                beam_next_shift: 0,
+                beam_saved_prefix_batches: true,
             },
         )
     }
@@ -756,6 +919,37 @@ impl State {
         resume_path: Option<&Path>,
         interrupted: &AtomicBool,
     ) -> Result<(SharedResults, bool), Box<dyn std::error::Error>> {
+        if let Some(path) = resume_path {
+            let checkpoint = Self::load_checkpoint(path)?;
+            if checkpoint.mode != SearchMode::Parallel {
+                return Err(format!(
+                    "{:?} mode checkpoint can only be resumed with --mode parallel",
+                    checkpoint.mode
+                )
+                .into());
+            }
+            self.apply_checkpoint_config(&checkpoint, depth)?;
+            if checkpoint.beam_saved_prefix_batches {
+                return self.search_saved_prefix_batches(
+                    depth,
+                    checkpoint_path,
+                    interrupted,
+                    SearchMode::Parallel,
+                );
+            }
+        } else if depth > 1
+            && self
+                .has_previous_depth_paths(depth)
+                .map_err(std::io::Error::other)?
+        {
+            return self.search_saved_prefix_batches(
+                depth,
+                checkpoint_path,
+                interrupted,
+                SearchMode::Parallel,
+            );
+        }
+
         let (mut frontier, mut level) = if let Some(path) = resume_path {
             let checkpoint = Self::load_checkpoint(path)?;
             if checkpoint.mode != SearchMode::Parallel {
@@ -772,17 +966,6 @@ impl State {
                     "Checkpoint predates beam search and cannot be resumed; use a different --output-dir",
                 )?,
                 checkpoint.beam_level,
-            )
-        } else if let Some(paths) = self.load_previous_depth_paths(depth)? {
-            (
-                paths
-                    .into_iter()
-                    .filter_map(|key| {
-                        let score = self.rebuild_masks(depth, &key)[key.len()].count_ones();
-                        (score >= self.target).then_some(BeamCandidate { key, score })
-                    })
-                    .collect(),
-                depth - 1,
             )
         } else {
             (
@@ -1269,6 +1452,7 @@ mod tests {
                     }],
                     beam_next_index: 0,
                     beam_next_shift: 1,
+                    beam_saved_prefix_batches: false,
                 },
             )
             .unwrap();
