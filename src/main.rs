@@ -472,7 +472,7 @@ fn run_search(
         info!("No saved depth 1 records; starting search from the root");
     }
 
-    let (completed, result) = match cli.mode {
+    let (completed, mut result) = match cli.mode {
         SearchMode::Sequential => {
             let completed = state
                 .search_with_checkpoint_interruptible(
@@ -488,9 +488,9 @@ fn run_search(
                     max_score: state.max_score,
                     results: state.results,
                     path_scores: vec![state.max_score; state.shifts.len()],
-                    shifts: state.shifts,
+                    shifts: state.shifts.clone(),
                     target_count: state.target_count,
-                    target_shifts: state.target_shifts,
+                    target_shifts: state.target_shifts.clone(),
                 },
             )
         }
@@ -518,6 +518,17 @@ fn run_search(
     };
 
     if completed {
+        let stored_records = state
+            .load_top_scored_paths(cli.depth, 100)
+            .map_err(|error| error.to_string())?;
+        if !stored_records.is_empty() {
+            let (path_scores, shifts): (Vec<_>, Vec<_>) = stored_records.into_iter().unzip();
+            result.max_score = path_scores[0];
+            result.results = shifts.len();
+            result.path_scores = path_scores;
+            result.shifts = shifts;
+        }
+
         for filename in [CHECKPOINT_FILENAME, CHECKPOINT_BACKUP_FILENAME] {
             let checkpoint_path = cli.output_dir.join(filename);
             if checkpoint_path.exists() {
@@ -696,7 +707,8 @@ impl App for AppState {
 
                 ui.add_space(10.0);
                 ui.label(format!(
-                    "Displayed paths: {} ({} tree nodes)",
+                    "Displayed depth {} records: {} ({} tree nodes)",
+                    result.config.depth,
                     result.result.shifts.len(),
                     self.search_tree.len().saturating_sub(1)
                 ));

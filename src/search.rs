@@ -2,8 +2,6 @@ use crate::bitmask::BitMask;
 use crate::rocksdb_output::ShiftPathStore;
 use log::{debug, info};
 use serde::{Deserialize, Serialize};
-use std::cmp::Ordering as CmpOrdering;
-use std::collections::BinaryHeap;
 use std::fs;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -50,26 +48,10 @@ struct ParallelInProgress {
 
 type ShiftPaths = Vec<Vec<usize>>;
 
-#[derive(Clone, Deserialize, Serialize, Eq, PartialEq)]
+#[derive(Clone, Deserialize, Serialize)]
 struct BeamCandidate {
     key: Vec<usize>,
     score: usize,
-    order: u64,
-}
-
-impl Ord for BeamCandidate {
-    fn cmp(&self, other: &Self) -> CmpOrdering {
-        other
-            .score
-            .cmp(&self.score)
-            .then_with(|| self.order.cmp(&other.order))
-    }
-}
-
-impl PartialOrd for BeamCandidate {
-    fn partial_cmp(&self, other: &Self) -> Option<CmpOrdering> {
-        Some(self.cmp(other))
-    }
 }
 
 #[derive(Deserialize, Serialize)]
@@ -107,8 +89,6 @@ struct Checkpoint {
     beam_next_index: usize,
     #[serde(default)]
     beam_next_shift: usize,
-    #[serde(default)]
-    beam_order: u64,
 }
 
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, clap::ValueEnum, Deserialize, Serialize)]
@@ -126,7 +106,6 @@ pub struct SharedResults {
     pub shifts: Vec<Vec<usize>>,
     pub target_count: usize,
     pub target_shifts: Vec<Vec<usize>>,
-    pub node_count: u64,
 }
 
 #[derive(Default)]
@@ -265,6 +244,22 @@ impl State {
         Ok((!paths.is_empty()).then_some(paths))
     }
 
+    fn load_candidates_from_store(&self, depth: usize) -> Result<Vec<BeamCandidate>, String> {
+        let store = self
+            .shift_path_store
+            .as_ref()
+            .ok_or_else(|| "RocksDB output is not configured".to_string())?;
+        let candidates = store
+            .load_full_depth_paths(depth)?
+            .into_iter()
+            .filter_map(|key| {
+                let score = self.rebuild_masks(depth, &key)[key.len()].count_ones();
+                (score >= self.target).then_some(BeamCandidate { key, score })
+            })
+            .collect();
+        Ok(candidates)
+    }
+
     fn aggregate_leaf_result(&mut self, score: usize, key: &[usize]) -> Result<(), String> {
         if score < self.target {
             return Ok(());
@@ -342,67 +337,63 @@ impl State {
         interrupted: &AtomicBool,
         mode: SearchMode,
     ) -> Result<(SharedResults, bool), Box<dyn std::error::Error>> {
-        let (mut frontier, mut level, next_frontier, mut next_index, mut next_shift, mut order) =
-            if let Some(path) = resume_path {
-                let checkpoint = Self::load_checkpoint(path)?;
-                if checkpoint.mode != mode {
-                    return Err(format!(
-                        "{:?} mode checkpoint can only be resumed with --mode {}",
-                        checkpoint.mode,
-                        match checkpoint.mode {
-                            SearchMode::Sequential => "sequential",
-                            SearchMode::Parallel => "parallel",
-                        }
-                    )
-                    .into());
-                }
-                self.apply_checkpoint_config(&checkpoint, depth)?;
-                let frontier = checkpoint.beam_frontier.ok_or(
+        let (mut frontier, mut level, next_frontier, mut next_index, mut next_shift) = if let Some(
+            path,
+        ) =
+            resume_path
+        {
+            let checkpoint = Self::load_checkpoint(path)?;
+            if checkpoint.mode != mode {
+                return Err(format!(
+                    "{:?} mode checkpoint can only be resumed with --mode {}",
+                    checkpoint.mode,
+                    match checkpoint.mode {
+                        SearchMode::Sequential => "sequential",
+                        SearchMode::Parallel => "parallel",
+                    }
+                )
+                .into());
+            }
+            self.apply_checkpoint_config(&checkpoint, depth)?;
+            let frontier = checkpoint.beam_frontier.ok_or(
                     "Checkpoint predates beam search and cannot be resumed; use a different --output-dir",
                 )?;
-                self.node_count = checkpoint.node_count;
-                (
-                    frontier,
-                    checkpoint.beam_level,
-                    checkpoint.beam_next_frontier,
-                    checkpoint.beam_next_index,
-                    checkpoint.beam_next_shift,
-                    checkpoint.beam_order,
-                )
-            } else if let Some(paths) = self.load_previous_depth_paths(depth)? {
-                let mut candidates = BinaryHeap::new();
-                for (order, key) in paths.into_iter().enumerate() {
-                    let score = self.rebuild_masks(depth, &key)[key.len()].count_ones();
-                    if score >= self.target {
-                        candidates.push(BeamCandidate {
-                            key,
-                            score,
-                            order: order as u64,
-                        });
-                    }
-                }
-                (
-                    Self::sorted_beam(candidates),
-                    depth - 1,
-                    Vec::new(),
-                    0,
-                    0,
-                    0,
-                )
+            let next_frontier = if self.shift_path_store.is_some() && checkpoint.beam_level < depth
+            {
+                self.load_candidates_from_store(checkpoint.beam_level + 1)
+                    .map_err(std::io::Error::other)?
             } else {
-                (
-                    vec![BeamCandidate {
-                        key: Vec::new(),
-                        score: self.zero_mask.count_ones(),
-                        order: 0,
-                    }],
-                    0,
-                    Vec::new(),
-                    0,
-                    0,
-                    0,
-                )
+                checkpoint.beam_next_frontier
             };
+            self.node_count = checkpoint.node_count;
+            (
+                frontier,
+                checkpoint.beam_level,
+                next_frontier,
+                checkpoint.beam_next_index,
+                checkpoint.beam_next_shift,
+            )
+        } else if let Some(paths) = self.load_previous_depth_paths(depth)? {
+            let candidates = paths
+                .into_iter()
+                .filter_map(|key| {
+                    let score = self.rebuild_masks(depth, &key)[key.len()].count_ones();
+                    (score >= self.target).then_some(BeamCandidate { key, score })
+                })
+                .collect();
+            (candidates, depth - 1, Vec::new(), 0, 0)
+        } else {
+            (
+                vec![BeamCandidate {
+                    key: Vec::new(),
+                    score: self.zero_mask.count_ones(),
+                }],
+                0,
+                Vec::new(),
+                0,
+                0,
+            )
+        };
 
         self.max_score = 0;
         self.results = 0;
@@ -410,7 +401,7 @@ impl State {
         self.target_count = 0;
         self.target_shifts.clear();
         let mut pending_appends = Vec::with_capacity(SHIFT_PATH_BATCH_SIZE);
-        let mut candidates = BinaryHeap::from(next_frontier);
+        let mut candidates = next_frontier;
         let mut current_index = None;
         let mut base_mask = self.zero_mask.clone();
         let mut restore_next_shift = resume_path.is_some();
@@ -426,10 +417,13 @@ impl State {
                     depth,
                     &frontier,
                     level,
-                    candidates.into_vec(),
+                    if self.shift_path_store.is_some() {
+                        Vec::new()
+                    } else {
+                        candidates.clone()
+                    },
                     next_index,
                     next_shift,
-                    order,
                 )?;
                 return Ok((SharedResults::default(), false));
             }
@@ -452,7 +446,6 @@ impl State {
                     shifts: self.shifts.clone(),
                     target_count: self.target_count,
                     target_shifts: self.target_shifts.clone(),
-                    node_count: self.node_count,
                 };
                 self.write_beam_checkpoint(
                     checkpoint_path,
@@ -463,15 +456,20 @@ impl State {
                     Vec::new(),
                     0,
                     0,
-                    order,
                 )?;
                 return Ok((results, true));
             }
 
             if next_index == frontier.len() {
-                frontier = Self::sorted_beam(candidates);
-                candidates = BinaryHeap::new();
                 level += 1;
+                self.submit_shift_path_batch(&mut pending_appends)
+                    .map_err(std::io::Error::other)?;
+                frontier = if self.shift_path_store.is_some() {
+                    self.load_candidates_from_store(level)
+                        .map_err(std::io::Error::other)?
+                } else {
+                    std::mem::take(&mut candidates)
+                };
                 next_index = 0;
                 next_shift = 0;
                 current_index = None;
@@ -479,10 +477,7 @@ impl State {
                 if frontier.is_empty() {
                     self.submit_shift_path_batch(&mut pending_appends)
                         .map_err(std::io::Error::other)?;
-                    let results = SharedResults {
-                        node_count: self.node_count,
-                        ..Default::default()
-                    };
+                    let results = SharedResults::default();
                     self.write_beam_checkpoint(
                         checkpoint_path,
                         mode,
@@ -492,7 +487,6 @@ impl State {
                         Vec::new(),
                         0,
                         0,
-                        order,
                     )?;
                     return Ok((results, true));
                 }
@@ -527,9 +521,9 @@ impl State {
                         self.submit_shift_path_batch(&mut pending_appends)
                             .map_err(std::io::Error::other)?;
                     }
+                } else {
+                    candidates.push(BeamCandidate { key, score });
                 }
-                candidates.push(BeamCandidate { key, score, order });
-                order += 1;
             }
 
             if self.node_count >= next_checkpoint {
@@ -548,25 +542,17 @@ impl State {
                     depth,
                     &frontier,
                     level,
-                    candidates.clone().into_vec(),
+                    if self.shift_path_store.is_some() {
+                        Vec::new()
+                    } else {
+                        candidates.clone()
+                    },
                     next_index,
                     next_shift,
-                    order,
                 )?;
                 next_checkpoint = self.node_count.saturating_add(self.checkpoint_interval);
             }
         }
-    }
-
-    fn sorted_beam(candidates: BinaryHeap<BeamCandidate>) -> Vec<BeamCandidate> {
-        let mut candidates = candidates.into_vec();
-        candidates.sort_by(|left, right| {
-            right
-                .score
-                .cmp(&left.score)
-                .then_with(|| left.order.cmp(&right.order))
-        });
-        candidates
     }
 
     fn write_beam_checkpoint(
@@ -579,7 +565,6 @@ impl State {
         next_frontier: Vec<BeamCandidate>,
         next_index: usize,
         next_shift: usize,
-        order: u64,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let Some(path) = path else {
             return Ok(());
@@ -609,7 +594,6 @@ impl State {
                 beam_next_frontier: next_frontier,
                 beam_next_index: next_index,
                 beam_next_shift: next_shift,
-                beam_order: order,
             },
         )
     }
@@ -938,7 +922,6 @@ mod tests {
             .unwrap();
         let result = state.search_parallel(2, None, None).unwrap();
 
-        assert_eq!(result.node_count, 3);
         assert!(result.shifts.iter().all(|path| path[0] == 1));
 
         drop(state);
@@ -1072,17 +1055,14 @@ mod tests {
                     beam_frontier: Some(vec![super::BeamCandidate {
                         key: Vec::new(),
                         score: cols,
-                        order: 0,
                     }]),
                     beam_level: 0,
                     beam_next_frontier: vec![super::BeamCandidate {
                         key: vec![1],
                         score: 2,
-                        order: 0,
                     }],
                     beam_next_index: 0,
                     beam_next_shift: 1,
-                    beam_order: 1,
                 },
             )
             .unwrap();
@@ -1141,7 +1121,6 @@ mod tests {
         assert_eq!(result.max_score, expected.max_score);
         assert_eq!(result.results, expected.results);
         assert_eq!(result.shifts, expected.shifts);
-        assert_eq!(result.node_count, expected.node_count);
 
         let backup_path = path.with_extension("bak");
         let _ = std::fs::remove_file(&path);
