@@ -196,6 +196,20 @@ impl State {
         }
     }
 
+    pub fn set_search_complete(&self, complete: bool) -> Result<(), String> {
+        self.shift_path_store
+            .as_ref()
+            .ok_or_else(|| "RocksDB output is not configured".to_string())?
+            .set_search_complete(complete)
+    }
+
+    pub fn is_search_complete(&self) -> Result<bool, String> {
+        self.shift_path_store
+            .as_ref()
+            .ok_or_else(|| "RocksDB output is not configured".to_string())?
+            .is_search_complete()
+    }
+
     fn update_progress(
         progress_reporter: Option<&SearchProgress>,
         nodes: u64,
@@ -875,7 +889,7 @@ impl State {
         Ok(())
     }
 
-    fn compute_config_hash(&self) -> u64 {
+    pub(crate) fn compute_config_hash(&self) -> u64 {
         let mut hash = 0u64;
         hash = hash.wrapping_mul(31).wrapping_add(self.primes.len() as u64);
         for &p in &self.primes {

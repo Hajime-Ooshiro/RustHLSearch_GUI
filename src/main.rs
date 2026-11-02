@@ -88,7 +88,12 @@ struct OutputResult {
 }
 
 #[derive(Parser, Debug, Clone)]
-#[command(author, version, about = "HLSearch: 素数シフト探索プログラム (Rust版)", long_about = None)]
+#[command(
+    author,
+    version,
+    about = "HLSearch: 素数シフト探索 GUI (Rust版)",
+    long_about = "CLI引数はGUIの初期設定に使用されます。起動後、Searchボタンで探索を開始します。"
+)]
 pub struct Cli {
     #[arg(short, long, default_value_t = 8, help = "探索する階層数")]
     pub depth: usize,
@@ -280,6 +285,7 @@ struct AppState {
     search_error: Option<String>,
     log_entries: Arc<Mutex<VecDeque<String>>>,
     search_progress: Arc<SearchProgress>,
+    interrupted: Arc<AtomicBool>,
     search_thread: Option<JoinHandle<Result<OutputFile<'static>, String>>>,
     is_searching: bool,
 }
@@ -359,11 +365,13 @@ impl AppState {
         self.search_results = None;
         self.search_tree.clear();
         self.search_progress = Arc::new(SearchProgress::default());
+        self.interrupted.store(false, Ordering::SeqCst);
 
         let cli = self.cli.clone();
         let progress = Arc::clone(&self.search_progress);
+        let interrupted = Arc::clone(&self.interrupted);
         self.search_thread = Some(std::thread::spawn(move || {
-            run_search(cli, progress, start_time)
+            run_search(cli, progress, interrupted, start_time)
         }));
         self.is_searching = true;
     }
@@ -388,6 +396,7 @@ impl AppState {
 fn run_search(
     cli: Cli,
     progress: Arc<SearchProgress>,
+    interrupted: Arc<AtomicBool>,
     start_time: Instant,
 ) -> Result<OutputFile<'static>, String> {
     let all_primes = generate_primes(MAX_PRIME);
@@ -414,12 +423,15 @@ fn run_search(
         )
         .map_err(|error| error.to_string())?;
 
-    let stored_records = state
-        .load_top_scored_paths(cli.depth, 100)
+    let completed_before = state
+        .is_search_complete()
         .map_err(|error| error.to_string())?;
-    if !stored_records.is_empty() {
+    if resume_path.is_none() && completed_before {
+        let stored_records = state
+            .load_top_scored_paths(cli.depth, 100)
+            .map_err(|error| error.to_string())?;
         let (path_scores, shifts): (Vec<_>, Vec<_>) = stored_records.into_iter().unzip();
-        let max_score = path_scores[0];
+        let max_score = path_scores.first().copied().unwrap_or(0);
         info!(
             "Displaying {} saved depth {} records ordered by score descending and node ID ascending",
             shifts.len(),
@@ -444,6 +456,11 @@ fn run_search(
                 target_shifts: Vec::new(),
             },
         });
+    }
+    if resume_path.is_none() {
+        state
+            .set_search_complete(false)
+            .map_err(|error| error.to_string())?;
     }
 
     if cli.depth > 1
@@ -479,7 +496,7 @@ fn run_search(
                     cli.depth,
                     Some(&checkpoint_path),
                     resume_path,
-                    &AtomicBool::new(false),
+                    &interrupted,
                 )
                 .map_err(|error| error.to_string())?;
             (
@@ -500,7 +517,7 @@ fn run_search(
                     cli.depth,
                     Some(&checkpoint_path),
                     resume_path,
-                    &AtomicBool::new(false),
+                    &interrupted,
                 )
                 .map_err(|error| error.to_string())?;
             (
@@ -517,27 +534,35 @@ fn run_search(
         }
     };
 
-    if completed {
-        let stored_records = state
-            .load_top_scored_paths(cli.depth, 100)
-            .map_err(|error| error.to_string())?;
-        if !stored_records.is_empty() {
-            let (path_scores, shifts): (Vec<_>, Vec<_>) = stored_records.into_iter().unzip();
-            result.max_score = path_scores[0];
-            result.results = shifts.len();
-            result.path_scores = path_scores;
-            result.shifts = shifts;
-        }
+    if !completed {
+        return Err(format!(
+            "Search interrupted; checkpoint saved to {}",
+            checkpoint_path.display()
+        ));
+    }
 
-        for filename in [CHECKPOINT_FILENAME, CHECKPOINT_BACKUP_FILENAME] {
-            let checkpoint_path = cli.output_dir.join(filename);
-            if checkpoint_path.exists() {
-                std::fs::remove_file(&checkpoint_path).map_err(|error| error.to_string())?;
-                info!(
-                    "Removed completed search checkpoint: {}",
-                    checkpoint_path.display()
-                );
-            }
+    state
+        .set_search_complete(true)
+        .map_err(|error| error.to_string())?;
+    let stored_records = state
+        .load_top_scored_paths(cli.depth, 100)
+        .map_err(|error| error.to_string())?;
+    if !stored_records.is_empty() {
+        let (path_scores, shifts): (Vec<_>, Vec<_>) = stored_records.into_iter().unzip();
+        result.max_score = path_scores[0];
+        result.results = shifts.len();
+        result.path_scores = path_scores;
+        result.shifts = shifts;
+    }
+
+    for filename in [CHECKPOINT_FILENAME, CHECKPOINT_BACKUP_FILENAME] {
+        let checkpoint_path = cli.output_dir.join(filename);
+        if checkpoint_path.exists() {
+            std::fs::remove_file(&checkpoint_path).map_err(|error| error.to_string())?;
+            info!(
+                "Removed completed search checkpoint: {}",
+                checkpoint_path.display()
+            );
         }
     }
 
@@ -744,17 +769,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         })?;
     }
 
-    // 3. Run the GUI application instead of exiting CLI style
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_inner_size([1200.0, 800.0]),
         ..Default::default()
     };
 
-    // Note: Due to the massive structural change required, I cannot reliably replace the entire execution path below
-    // with a simple call because the search logic depends heavily on CLI arguments and exiting state cleanup.
-    // The user must adapt `AppState::run_search` and the initialization above carefully.
-
-    // For now, we provide the eframe run loop structure:
     eframe::run_native(
         "HLSearch Visualizer",
         options,
@@ -768,6 +787,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 search_error: None,
                 log_entries: Arc::clone(&log_entries),
                 search_progress: Arc::new(SearchProgress::default()),
+                interrupted: Arc::clone(&interrupted),
                 search_thread: None,
                 is_searching: false,
             };
@@ -780,14 +800,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             format!("Failed to run eframe: {}", e),
         )
     })?;
-
-    // If the user still prefers CLI output fallback (for testing/non-GUI use):
-    /*
-    if initial_state.search_results.is_some() {
-        println!("\n--- GUI mode skipped. Displaying structured result (Fallback) ---");
-        // Logic to write results...
-    }
-    */
 
     Ok(())
 }
@@ -897,9 +909,81 @@ mod tests {
         let mut cli = test_cli();
         cli.output_dir = output_dir.clone();
 
-        let result = run_search(cli, Arc::new(SearchProgress::default()), Instant::now());
+        let result = run_search(
+            cli.clone(),
+            Arc::new(SearchProgress::default()),
+            Arc::new(AtomicBool::new(false)),
+            Instant::now(),
+        );
 
         assert!(result.is_ok());
+        let cached_result = run_search(
+            cli,
+            Arc::new(SearchProgress::default()),
+            Arc::new(AtomicBool::new(false)),
+            Instant::now(),
+        )
+        .unwrap();
+        assert!(cached_result.result.shifts.is_empty());
+        std::fs::remove_dir_all(output_dir).unwrap();
+    }
+
+    #[test]
+    fn incomplete_saved_paths_do_not_bypass_checkpoint_resume() {
+        let output_dir = std::env::temp_dir().join(format!(
+            "hlsearch-resume-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&output_dir).unwrap();
+
+        let mut cli = test_cli();
+        cli.output_dir = output_dir.clone();
+        let primes = generate_primes(MAX_PRIME);
+        let shift_table = build_shift_table(&primes[..cli.depth], cli.cols);
+        let state = State::new(primes.clone(), cli.cols, shift_table.clone());
+        let store_path = output_dir.join("HLSearch.rocksdb");
+        let store = crate::rocksdb_output::ShiftPathStore::create(
+            &store_path,
+            cli.depth,
+            true,
+            state.compute_config_hash(),
+        )
+        .unwrap();
+        store.append(447, &[0]).unwrap();
+        store.set_search_complete(false).unwrap();
+        drop(store);
+
+        let mut state = State::new(primes, cli.cols, shift_table);
+        state
+            .set_shift_path_store(&store_path, cli.depth, false)
+            .unwrap();
+
+        let checkpoint_path = output_dir.join(CHECKPOINT_FILENAME);
+        let interrupted = AtomicBool::new(true);
+        state
+            .search_with_checkpoint_interruptible(
+                cli.depth,
+                Some(&checkpoint_path),
+                None,
+                &interrupted,
+            )
+            .unwrap();
+        drop(state);
+
+        let result = run_search(
+            cli,
+            Arc::new(SearchProgress::default()),
+            Arc::new(AtomicBool::new(true)),
+            Instant::now(),
+        );
+
+        let error = result.err().unwrap();
+        assert!(error.contains("Search interrupted; checkpoint saved"));
+        assert!(checkpoint_path.exists());
         std::fs::remove_dir_all(output_dir).unwrap();
     }
 

@@ -12,7 +12,8 @@
 
 use rocksdb::{ColumnFamilyDescriptor, Direction, IteratorMode, Options, WriteBatch, DB};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -76,6 +77,10 @@ fn target_key(depth: usize, target_shifts: &str) -> Vec<u8> {
 
 fn config_key(depth: usize) -> String {
     format!("config_hash:{depth}")
+}
+
+fn completion_key(depth: usize) -> String {
+    format!("search_complete:{depth}")
 }
 
 fn cf<'a>(db: &'a DB, name: &str) -> Result<&'a rocksdb::ColumnFamily, String> {
@@ -240,6 +245,27 @@ impl ShiftPathStore {
         Ok(())
     }
 
+    pub fn set_search_complete(&self, complete: bool) -> Result<(), String> {
+        let meta_cf = cf(&self.db, CF_META)?;
+        self.db
+            .put_cf(meta_cf, completion_key(self.depth), [u8::from(complete)])
+            .map_err(err)
+    }
+
+    pub fn is_search_complete(&self) -> Result<bool, String> {
+        let meta_cf = cf(&self.db, CF_META)?;
+        match self
+            .db
+            .get_cf(meta_cf, completion_key(self.depth))
+            .map_err(err)?
+        {
+            Some(value) if value.as_ref() == [1] => Ok(true),
+            Some(value) if value.as_ref() == [0] => Ok(false),
+            Some(_) => Err("不正な探索完了フラグです".to_string()),
+            None => Ok(false),
+        }
+    }
+
     #[allow(dead_code)] // Optional result-loading API.
     pub fn load_result_paths(&self, max_count: usize) -> Result<Vec<Vec<usize>>, String> {
         self.load_leaf_paths(self.depth, Some(max_count))
@@ -298,19 +324,54 @@ impl ShiftPathStore {
         depth: usize,
         limit: usize,
     ) -> Result<Vec<(usize, Vec<usize>)>, String> {
-        let mut leaves = self.load_nodes(depth)?;
-        leaves.sort_by(|(left_id, left), (right_id, right)| {
-            right
-                .score
-                .cmp(&left.score)
+        self.flush()?;
+        if depth == 0 || depth > MAX_DEPTH || limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let nodes_cf = cf(&self.db, CF_NODES)?;
+        let start = make_node_id(depth, 0).to_be_bytes();
+        let mut top = BinaryHeap::new();
+        for item in self
+            .db
+            .iterator_cf(nodes_cf, IteratorMode::From(&start, Direction::Forward))
+        {
+            let (key, value) = item.map_err(err)?;
+            let node_id = decode_u64(&key)?;
+            if node_depth(node_id) != depth {
+                break;
+            }
+            let record: NodeRecord = serde_json::from_slice(&value).map_err(err)?;
+            let candidate = (Reverse(record.score), node_id);
+            if top.len() < limit {
+                top.push(candidate);
+            } else if top.peek().is_some_and(|worst| candidate < *worst) {
+                top.pop();
+                top.push(candidate);
+            }
+        }
+
+        let mut leaves: Vec<_> = top
+            .into_iter()
+            .map(|(Reverse(score), node_id)| (score, node_id))
+            .collect();
+        leaves.sort_unstable_by(|(left_score, left_id), (right_score, right_id)| {
+            right_score
+                .cmp(left_score)
                 .then_with(|| left_id.cmp(right_id))
         });
-        leaves.truncate(limit);
-        let scores: Vec<usize> = leaves.iter().map(|(_, record)| record.score).collect();
-        let paths = self.reconstruct_leaf_paths(
-            depth,
-            leaves.into_iter().map(|(_, record)| record).collect(),
-        )?;
+        let records = leaves
+            .iter()
+            .map(|(_, node_id)| {
+                read_node(&self.db, *node_id)?
+                    .ok_or_else(|| format!("node_id {node_id} がありません"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let scores = leaves
+            .into_iter()
+            .map(|(score, _)| score)
+            .collect::<Vec<_>>();
+        let paths = self.reconstruct_leaf_paths(depth, records)?;
         Ok(scores.into_iter().zip(paths).collect())
     }
 
@@ -651,6 +712,23 @@ mod tests {
         let store = ShiftPathStore::create(&path, 2, true, 1).unwrap();
         drop(store);
         assert!(ShiftPathStore::create(&path, 2, false, 2).is_err());
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn persists_search_completion_state() {
+        let path = database_path();
+        let store = ShiftPathStore::create(&path, 2, true, 12345).unwrap();
+        assert!(!store.is_search_complete().unwrap());
+        store.set_search_complete(true).unwrap();
+        assert!(store.is_search_complete().unwrap());
+        drop(store);
+
+        let store = ShiftPathStore::create(&path, 2, false, 12345).unwrap();
+        assert!(store.is_search_complete().unwrap());
+        store.set_search_complete(false).unwrap();
+        assert!(!store.is_search_complete().unwrap());
+        drop(store);
         std::fs::remove_dir_all(path).unwrap();
     }
 }

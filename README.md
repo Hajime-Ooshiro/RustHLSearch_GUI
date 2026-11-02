@@ -76,33 +76,27 @@ cargo run --release
 
 Depth は 1 以上、利用可能な素数数以下である必要があります。無効な値や検索中のエラーは TopView に表示されます。
 
-### コマンドライン引数の例
+### 起動オプション
 
-デフォルト（並列モード、深さ 8、cols 3159）:
+CLI 引数は GUI の初期設定を指定します。起動後に Search ボタンを押すと探索を開始します。引数を指定しない場合は並列モード、深さ 8、cols 3159 で起動します。
 
 ```bash
 cargo run --release
 ```
 
-逐次モード（単一スレッド）で実行:
+逐次モード・深さ 8 を初期設定にして GUI を起動:
 
 ```bash
 cargo run --release -- --mode sequential --depth 8
 ```
 
-逐次探索では `--output-dir`（既定はカレントディレクトリ）配下に `checkpoint.json` を自動保存・再開します:
+探索のチェックポイントとログの保存先を指定:
 
 ```bash
-cargo run --release -- --mode sequential
+cargo run --release -- --depth 10 --cols 4000 --output-dir results
 ```
 
-並列探索も同じファイルへチェックポイントを保存し、同じコマンドで再開できます:
-
-```bash
-cargo run --release -- --mode parallel
-```
-
-探索中は 100,000 ノードごとに進捗を更新し、ビームの状態と集計値を `--output-dir`（既定は `.`）配下の `checkpoint.json` に自動保存します。実行中に `Ctrl+C` を1回押すと、安全な探索地点で同じチェックポイントを保存して終了します。次回は同じ設定で起動すると中断地点から再開できます。シフトパスとターゲット一致パスは `HLSearch.rocksdb` に保存され、再開時にそこから復元します。更新前の世代は同じディレクトリの `checkpoint.bak` に退避されます。起動時に `checkpoint.json` が存在しない場合は `checkpoint.bak` から復旧を試みます。GUI からの探索が正常終了すると `checkpoint.json` とバックアップを削除します。中断時は再開用に残します。逐次チェックポイントは `--mode sequential` でのみ、並列チェックポイントは `--mode parallel` でのみ再開できます。
+探索中は 100,000 ノードごとに進捗を更新し、ビームの状態と集計値を `--output-dir`（既定は `.`）配下の `checkpoint.json` に自動保存します。探索中に `Ctrl+C` を押すと、安全な探索地点でチェックポイントを保存して探索を中断します。GUI は開いたままで、エラー表示に保存先が示されます。再開するには同じ設定で再度 Search を押してください。シフトパスとターゲット一致パスは `HLSearch.rocksdb` に保存され、再開時にそこから復元します。更新前の世代は同じディレクトリの `checkpoint.bak` に退避されます。起動時に `checkpoint.json` が存在しない場合は `checkpoint.bak` から復旧を試みます。正常終了すると `checkpoint.json` とバックアップを削除します。中断時は再開用に残します。逐次チェックポイントは `--mode sequential` でのみ、並列チェックポイントは `--mode parallel` でのみ再開できます。
 
 探索開始時、同じ `HLSearch.rocksdb` に前深さの保存済みパスがあれば、そのパスを開始パスとして再利用します。前深さのパスが存在しない場合、または深さ 1 の保存済みパスが存在しない場合は、先頭レベルから探索します。
 
@@ -115,12 +109,6 @@ cargo run --release -- --checkpoint-interval 50000
 ```
 
 `--checkpoint-interval` でノード数を指定できます（デフォルト: 100,000）。逐次・並列のどちらでも有効です。
-
-深さ、列数、出力先を指定して実行:
-
-```bash
-cargo run --release -- --depth 10 --cols 4000 --output-dir results
-```
 
 > **Note**: 現在は逐次・並列の両モードで同じ決定論的なビームサーチを実行します。モードは既存のCLI互換性とチェックポイントの再開検証のため維持されています。
 
