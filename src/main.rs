@@ -388,7 +388,7 @@ impl AppState {
                 self.search_results = Some(result);
             }
             Ok(Err(error)) => self.search_error = Some(error),
-            Err(_) => self.search_error = Some("Search thread panicked".to_string()),
+            Err(_) => self.search_error = Some("検索スレッドが異常終了しました".to_string()),
         }
     }
 }
@@ -520,7 +520,7 @@ fn run_search(
 
     if !completed {
         return Err(format!(
-            "Search interrupted; checkpoint saved to {}",
+            "検索が中断されました。チェックポイントを保存しました: {}",
             checkpoint_path.display()
         ));
     }
@@ -639,15 +639,15 @@ impl App for AppState {
             .resizable(true)
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    ui.heading("TopView");
+                    ui.heading("探索設定");
                     ui.separator();
-                    ui.label("Depth");
+                    ui.label("深さ");
                     ui.add_enabled(
                         !self.is_searching,
                         egui::TextEdit::singleline(&mut self.depth_input).desired_width(80.0),
                     );
                     search_requested = ui
-                        .add_enabled(!self.is_searching, egui::Button::new("Search"))
+                        .add_enabled(!self.is_searching, egui::Button::new("検索"))
                         .clicked();
                 });
                 if let Some(error) = &self.search_error {
@@ -659,7 +659,7 @@ impl App for AppState {
             .default_height(120.0)
             .resizable(true)
             .show(ctx, |ui| {
-                ui.heading("BottomView");
+                ui.heading("ログ");
                 ui.separator();
 
                 let entries = self
@@ -688,12 +688,12 @@ impl App for AppState {
                     self.cli.depth = depth;
                     self.start_search();
                 }
-                Err(_) => self.search_error = Some("Depth must be a positive integer".to_string()),
+                Err(_) => self.search_error = Some("深さは正の整数で入力してください".to_string()),
             }
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("MainView");
+            ui.heading("探索結果");
             if self.is_searching {
                 let progress = self.search_progress.snapshot();
                 ui.separator();
@@ -701,37 +701,37 @@ impl App for AppState {
                     (progress.depth as f32 / self.cli.depth.max(1) as f32).clamp(0.0, 1.0);
                 ui.add(
                     egui::ProgressBar::new(depth_fraction)
-                        .text(format!("Depth {}/{}", progress.depth, self.cli.depth)),
+                        .text(format!("深さ {}/{}", progress.depth, self.cli.depth)),
                 );
                 ui.horizontal(|ui| {
                     ui.spinner();
                     ui.label(format!(
-                        "Searching: nodes={} best={} hits={}",
+                        "検索中: ノード={} 最良={} ヒット={}",
                         progress.node_count, progress.max_score, progress.results
                     ));
                 });
-                ui.label(format!("Elapsed: {:?}", self.start_time.elapsed()));
+                ui.label(format!("経過時間: {:?}", self.start_time.elapsed()));
             }
 
             if let Some(result) = &self.search_results {
                 ui.separator();
                 ui.label(format!(
-                    "Search Finished! Max Score: {}",
+                    "検索完了！ 最大スコア: {}",
                     result.result.max_score
                 ));
 
                 ui.add_space(10.0);
                 ui.label(format!(
-                    "Displayed depth {} records: {} ({} tree nodes)",
+                    "深さ {} の結果: {}件 (ツリー ノード {}個)",
                     result.config.depth,
                     result.result.shifts.len(),
                     self.search_tree.len().saturating_sub(1)
                 ));
                 show_search_tree(ui, &self.search_tree);
             } else if !self.is_searching {
-                ui.label("Press 'Search' to begin visualization.");
+                ui.label("『検索』を押して可視化を開始してください。");
             } else {
-                ui.label("Search is running...");
+                ui.label("検索実行中...");
             }
         });
     }
@@ -765,7 +765,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     eframe::run_native(
-        "HLSearch Visualizer",
+        "HLSearch 可視化ツール",
         options,
         Box::new(move |_cc| {
             let app = AppState {
@@ -973,7 +973,7 @@ mod tests {
         );
 
         let error = result.err().unwrap();
-        assert!(error.contains("Search interrupted; checkpoint saved"));
+        assert!(error.contains("検索が中断されました。チェックポイントを保存しました"));
         assert!(checkpoint_path.exists());
         std::fs::remove_dir_all(output_dir).unwrap();
     }
