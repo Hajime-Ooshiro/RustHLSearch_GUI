@@ -318,21 +318,13 @@ impl State {
                     let mut mask = self.zero_mask.clone();
                     let score = mask.bitand_into_count(&base_mask, &self.shift_table[level][shift]);
                     nodes += 1;
-                    if nodes % PROGRESS_UPDATE_NODE_INTERVAL == 0 {
-                        if let Some(reporter) = progress_reporter {
-                            reporter.add_nodes(PROGRESS_UPDATE_NODE_INTERVAL);
-                        }
+                    if let Some(reporter) = progress_reporter {
+                        reporter.add_nodes(1);
                     }
                     if score >= self.target {
                         let mut key = candidate.key.clone();
                         key.push(shift);
                         candidates.push(BeamCandidate { key, score });
-                    }
-                }
-                let reported_nodes = nodes % PROGRESS_UPDATE_NODE_INTERVAL;
-                if reported_nodes > 0 {
-                    if let Some(reporter) = progress_reporter {
-                        reporter.add_nodes(reported_nodes);
                     }
                 }
                 (nodes, candidates)
@@ -1201,12 +1193,12 @@ mod tests {
     }
 
     #[test]
-    fn progress_reporter_adds_nodes_during_search() {
+    fn progress_reporter_adds_individual_nodes_during_search() {
         let progress = super::SearchProgress::default();
         progress.update(1_000, 0, 0, 2);
-        progress.add_nodes(256);
+        progress.add_nodes(1);
 
-        assert_eq!(progress.snapshot().node_count, 1_256);
+        assert_eq!(progress.snapshot().node_count, 1_001);
     }
 
     #[test]
@@ -1219,12 +1211,15 @@ mod tests {
         sequential.search_with_checkpoint(2, None, None).unwrap();
         let mut parallel = State::new(primes.clone(), cols, table);
         parallel.target = 0;
+        let progress = std::sync::Arc::new(super::SearchProgress::default());
+        parallel.set_progress_reporter(std::sync::Arc::clone(&progress));
         let result = parallel.search_parallel(2, None, None).unwrap();
 
         assert!(sequential.results > 0);
         assert_eq!(result.max_score, sequential.max_score);
         assert_eq!(result.results, sequential.results);
         assert_eq!(result.shifts.len(), result.results);
+        assert_eq!(progress.snapshot().node_count, parallel.node_count);
         for shifts in &result.shifts {
             assert_eq!(shifts.len(), 2);
             for (level, &shift) in shifts.iter().enumerate() {

@@ -1,5 +1,5 @@
 rem debug build
-cargo build -vv -j 1
+cargo build 
 rem release
 cargo build --release
 pause
