@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 const SHIFT_PATH_BATCH_SIZE: usize = 256;
 const PREVIOUS_DEPTH_BATCH_SIZE: usize = 500;
+const PROGRESS_UPDATE_NODE_INTERVAL: u64 = 256;
 const BEAM_POLICY_VERSION: u64 = 2;
 
 /// 基底行の生成と補集合シフトテーブルの作成
@@ -143,6 +144,10 @@ impl SearchProgress {
         self.max_score.store(max_score, Ordering::Relaxed);
         self.results.store(results, Ordering::Relaxed);
         self.depth.store(depth, Ordering::Relaxed);
+    }
+
+    fn add_nodes(&self, nodes: u64) {
+        self.node_count.fetch_add(nodes, Ordering::Relaxed);
     }
 }
 
@@ -295,6 +300,7 @@ impl State {
         level: usize,
         interrupted: &AtomicBool,
     ) -> Option<(u64, Vec<BeamCandidate>)> {
+        let progress_reporter = self.progress_reporter.as_deref();
         let evaluated: Vec<_> = frontier
             .par_iter()
             .map(|candidate| {
@@ -312,10 +318,21 @@ impl State {
                     let mut mask = self.zero_mask.clone();
                     let score = mask.bitand_into_count(&base_mask, &self.shift_table[level][shift]);
                     nodes += 1;
+                    if nodes % PROGRESS_UPDATE_NODE_INTERVAL == 0 {
+                        if let Some(reporter) = progress_reporter {
+                            reporter.add_nodes(PROGRESS_UPDATE_NODE_INTERVAL);
+                        }
+                    }
                     if score >= self.target {
                         let mut key = candidate.key.clone();
                         key.push(shift);
                         candidates.push(BeamCandidate { key, score });
+                    }
+                }
+                let reported_nodes = nodes % PROGRESS_UPDATE_NODE_INTERVAL;
+                if reported_nodes > 0 {
+                    if let Some(reporter) = progress_reporter {
+                        reporter.add_nodes(reported_nodes);
                     }
                 }
                 (nodes, candidates)
@@ -389,6 +406,13 @@ impl State {
         self.shifts.clear();
         self.target_count = 0;
         self.target_shifts.clear();
+        Self::update_progress(
+            self.progress_reporter.as_deref(),
+            self.node_count,
+            self.max_score,
+            self.results,
+            depth,
+        );
 
         loop {
             if interrupted.load(Ordering::SeqCst) {
@@ -439,6 +463,15 @@ impl State {
                             let score = mask
                                 .bitand_into_count(&base_mask, &self.shift_table[depth - 1][shift]);
                             self.node_count += 1;
+                            if self.node_count % PROGRESS_UPDATE_NODE_INTERVAL == 0 {
+                                Self::update_progress(
+                                    self.progress_reporter.as_deref(),
+                                    self.node_count,
+                                    self.max_score,
+                                    self.results,
+                                    depth,
+                                );
+                            }
                             if score >= self.target {
                                 let mut key = candidate.key.clone();
                                 key.push(shift);
@@ -477,6 +510,13 @@ impl State {
             self.submit_shift_path_batch(&mut pending_appends)
                 .map_err(std::io::Error::other)?;
             store.flush().map_err(std::io::Error::other)?;
+            Self::update_progress(
+                self.progress_reporter.as_deref(),
+                self.node_count,
+                self.max_score,
+                self.results,
+                depth,
+            );
         }
     }
 
@@ -607,6 +647,16 @@ impl State {
         let mut base_mask = self.zero_mask.clone();
         let mut restore_next_shift = resume_path.is_some();
         let mut next_checkpoint = self.node_count.saturating_add(self.checkpoint_interval);
+        let mut next_progress = self
+            .node_count
+            .saturating_add(PROGRESS_UPDATE_NODE_INTERVAL);
+        Self::update_progress(
+            self.progress_reporter.as_deref(),
+            self.node_count,
+            self.max_score,
+            self.results,
+            level,
+        );
 
         loop {
             if interrupted.load(Ordering::SeqCst) {
@@ -727,7 +777,7 @@ impl State {
                 }
             }
 
-            if self.node_count >= next_checkpoint {
+            if self.node_count >= next_progress {
                 Self::update_progress(
                     self.progress_reporter.as_deref(),
                     self.node_count,
@@ -735,6 +785,12 @@ impl State {
                     self.results,
                     level + 1,
                 );
+                next_progress = self
+                    .node_count
+                    .saturating_add(PROGRESS_UPDATE_NODE_INTERVAL);
+            }
+
+            if self.node_count >= next_checkpoint {
                 self.submit_shift_path_batch(&mut pending_appends)
                     .map_err(std::io::Error::other)?;
                 self.write_beam_checkpoint(
@@ -997,6 +1053,13 @@ impl State {
         self.target_count = 0;
         self.target_shifts.clear();
         let mut next_checkpoint = self.node_count.saturating_add(self.checkpoint_interval);
+        Self::update_progress(
+            self.progress_reporter.as_deref(),
+            self.node_count,
+            self.max_score,
+            self.results,
+            level,
+        );
 
         loop {
             if interrupted.load(Ordering::SeqCst) {
@@ -1135,6 +1198,15 @@ mod tests {
                 depth: 4,
             }
         );
+    }
+
+    #[test]
+    fn progress_reporter_adds_nodes_during_search() {
+        let progress = super::SearchProgress::default();
+        progress.update(1_000, 0, 0, 2);
+        progress.add_nodes(256);
+
+        assert_eq!(progress.snapshot().node_count, 1_256);
     }
 
     #[test]
