@@ -463,25 +463,9 @@ fn run_search(
             .map_err(|error| error.to_string())?;
     }
 
-    if cli.depth > 1
-        && state
-            .load_top_scored_paths(cli.depth - 1, 1)
-            .map_err(|error| error.to_string())?
-            .is_empty()
-    {
-        return Err(format!(
-            "No records exist for depth {}{}",
-            cli.depth,
-            if cli.depth > 1 {
-                format!(" or depth {}", cli.depth - 1)
-            } else {
-                String::new()
-            }
-        ));
-    }
     if cli.depth > 1 {
         info!(
-            "No saved depth {} records; starting beam search from saved depth {} records",
+            "Starting depth {} beam search from saved depth {} records when available, otherwise from the root",
             cli.depth,
             cli.depth - 1
         );
@@ -713,11 +697,17 @@ impl App for AppState {
             if self.is_searching {
                 let progress = self.search_progress.snapshot();
                 ui.separator();
+                let depth_fraction =
+                    (progress.depth as f32 / self.cli.depth.max(1) as f32).clamp(0.0, 1.0);
+                ui.add(
+                    egui::ProgressBar::new(depth_fraction)
+                        .text(format!("Depth {}/{}", progress.depth, self.cli.depth)),
+                );
                 ui.horizontal(|ui| {
                     ui.spinner();
                     ui.label(format!(
-                        "Searching: nodes={} best={} hits={} depth={}",
-                        progress.node_count, progress.max_score, progress.results, progress.depth
+                        "Searching: nodes={} best={} hits={}",
+                        progress.node_count, progress.max_score, progress.results
                     ));
                 });
                 ui.label(format!("Elapsed: {:?}", self.start_time.elapsed()));
@@ -896,7 +886,7 @@ mod tests {
     }
 
     #[test]
-    fn search_runs_when_depth_one_has_no_saved_records() {
+    fn search_runs_from_root_when_previous_depth_has_no_saved_records() {
         let output_dir = std::env::temp_dir().join(format!(
             "hlsearch-depth-one-search-test-{}-{}",
             std::process::id(),
@@ -907,6 +897,7 @@ mod tests {
         ));
         std::fs::create_dir(&output_dir).unwrap();
         let mut cli = test_cli();
+        cli.depth = 2;
         cli.output_dir = output_dir.clone();
 
         let result = run_search(

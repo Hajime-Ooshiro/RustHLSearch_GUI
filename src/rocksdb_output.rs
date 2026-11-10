@@ -18,6 +18,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 const MAX_DEPTH: usize = 249;
+const APPEND_BATCH_SIZE: usize = 4096;
 const DEPTH_SHIFT: u32 = 48;
 const SEQ_MASK: u64 = (1u64 << DEPTH_SHIFT) - 1;
 
@@ -142,6 +143,11 @@ impl ShiftPathStore {
             .lock()
             .map_err(|_| "バッファのロック取得に失敗しました".to_string())?;
         buffer.append(&mut appends);
+        let should_flush = buffer.len() >= APPEND_BATCH_SIZE;
+        drop(buffer);
+        if should_flush {
+            self.flush()?;
+        }
         Ok(())
     }
 
