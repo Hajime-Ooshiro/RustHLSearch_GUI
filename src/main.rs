@@ -12,7 +12,7 @@ use search::{build_shift_table, SearchMode, SearchProgress, State};
 use serde::Serialize;
 use std::collections::{HashMap, VecDeque};
 use std::fs::File;
-use std::io::{BufWriter, Write};
+use std::io::{self, BufWriter, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -393,6 +393,70 @@ impl AppState {
     }
 }
 
+fn japanese_font_path() -> io::Result<PathBuf> {
+    let mut candidates = Vec::new();
+
+    if let Some(windows_dir) = std::env::var_os("WINDIR") {
+        let fonts_dir = PathBuf::from(windows_dir).join("Fonts");
+        for font_name in [
+            "NotoSansJP-VF.ttf",
+            "YuGothR.ttc",
+            "meiryo.ttc",
+            "BIZ-UDGothicR.ttc",
+        ] {
+            candidates.push(fonts_dir.join(font_name));
+        }
+    }
+
+    if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
+        let fonts_dir = PathBuf::from(local_app_data).join("Microsoft/Windows/Fonts");
+        candidates.push(fonts_dir.join("NotoSansJP-VF.ttf"));
+    }
+
+    candidates.extend([
+        PathBuf::from("/System/Library/Fonts/ヒラギノ角ゴシック W3.ttc"),
+        PathBuf::from("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"),
+        PathBuf::from("/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc"),
+        PathBuf::from("/usr/share/fonts/opentype/noto/NotoSansCJKjp-Regular.otf"),
+        PathBuf::from("/usr/share/fonts/opentype/ipafont-gothic/ipag.ttf"),
+    ]);
+
+    candidates
+        .into_iter()
+        .find(|path| path.is_file())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "日本語フォントが見つかりません。Noto Sans JP などの日本語フォントをインストールしてください。",
+            )
+        })
+}
+
+fn japanese_font_definitions(font_data: egui::FontData) -> egui::FontDefinitions {
+    let mut fonts = egui::FontDefinitions::default();
+    fonts.font_data.insert("Japanese".to_owned(), font_data);
+    for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+        fonts
+            .families
+            .entry(family)
+            .or_default()
+            .insert(0, "Japanese".to_owned());
+    }
+    fonts
+}
+
+fn has_japanese_ui_glyphs(ctx: &egui::Context, font_definitions: &egui::FontDefinitions) -> bool {
+    let mut has_glyphs = false;
+    let _ = ctx.run(egui::RawInput::default(), |ctx| {
+        ctx.set_fonts(font_definitions.clone());
+    });
+    let _ = ctx.run(egui::RawInput::default(), |ctx| {
+        has_glyphs = ctx
+            .fonts(|fonts| fonts.has_glyphs(&egui::FontId::proportional(14.0), "日本語の表示確認"));
+    });
+    has_glyphs
+}
+
 fn run_search(
     cli: Cli,
     progress: Arc<SearchProgress>,
@@ -759,6 +823,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         })?;
     }
 
+    let font_path = japanese_font_path()?;
+    let japanese_fonts =
+        japanese_font_definitions(egui::FontData::from_owned(std::fs::read(&font_path)?));
+    let font_check_context = egui::Context::default();
+    if !has_japanese_ui_glyphs(&font_check_context, &japanese_fonts) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "日本語フォントで必要な文字を表示できません: {}",
+                font_path.display()
+            ),
+        )
+        .into());
+    }
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_inner_size([1200.0, 800.0]),
         ..Default::default()
@@ -767,7 +846,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     eframe::run_native(
         "HLSearch 可視化ツール",
         options,
-        Box::new(move |_cc| {
+        Box::new(move |cc| {
+            cc.egui_ctx.set_fonts(japanese_fonts);
             let app = AppState {
                 cli: cli.clone(),
                 start_time: Instant::now(),
@@ -796,6 +876,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn japanese_font_supports_ui_glyphs_when_available() {
+        let Ok(path) = japanese_font_path() else {
+            return;
+        };
+        let context = egui::Context::default();
+        let fonts =
+            japanese_font_definitions(egui::FontData::from_owned(std::fs::read(path).unwrap()));
+
+        assert!(has_japanese_ui_glyphs(&context, &fonts));
+    }
 
     #[test]
     fn ui_logger_writes_entries_to_text_file() {
