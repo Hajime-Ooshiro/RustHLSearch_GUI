@@ -6,21 +6,29 @@
 //! - `target_paths` CF: (depth, target_shifts JSON) -> target_count
 //! - `meta` CF: 設定ハッシュ
 //!
-//! node_id は全深さで一意で、上位 16 bit に深さ、下位 48 bit に連番を持つ。
+//! node_id は全深さで一意で、上位 16 bit に深さ、下位 48 bit に連番とシャード番号を持つ。
 //! そのためビッグエンディアンのキー順 = (深さ, 連番) 順となり、
 //! 特定の深さのノードを範囲スキャンで列挙できる。
 
-use rocksdb::{ColumnFamilyDescriptor, Direction, IteratorMode, Options, WriteBatch, DB};
+use rocksdb::{
+    BlockBasedOptions, Cache, ColumnFamilyDescriptor, Direction, IteratorMode, Options, WriteBatch,
+    WriteBufferManager, DB,
+};
 use serde::{Deserialize, Serialize};
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 const MAX_DEPTH: usize = 249;
 const APPEND_BATCH_SIZE: usize = 4096;
+const SHARD_COUNT: usize = 256;
+const SHARED_CACHE_SIZE: usize = 32 * 1024 * 1024;
+const SHARED_WRITE_BUFFER_SIZE: usize = 128 * 1024 * 1024;
+const SHARD_BITS: u32 = 8;
 const DEPTH_SHIFT: u32 = 48;
 const SEQ_MASK: u64 = (1u64 << DEPTH_SHIFT) - 1;
+const NODE_SEQ_MASK: u64 = SEQ_MASK >> SHARD_BITS;
 
 const CF_NODES: &str = "nodes";
 const CF_INDEX: &str = "node_index";
@@ -42,8 +50,8 @@ fn err<E: ToString>(error: E) -> String {
     error.to_string()
 }
 
-fn make_node_id(depth: usize, seq: u64) -> u64 {
-    ((depth as u64) << DEPTH_SHIFT) | (seq & SEQ_MASK)
+fn make_node_id(depth: usize, seq: u64, shard: usize) -> u64 {
+    ((depth as u64) << DEPTH_SHIFT) | ((seq & NODE_SEQ_MASK) << SHARD_BITS) | shard as u64
 }
 
 fn node_depth(node_id: u64) -> usize {
@@ -63,6 +71,38 @@ fn index_key(parent_node_id: Option<u64>, shift: usize) -> [u8; 16] {
     key[..8].copy_from_slice(&parent_node_id.unwrap_or(0).to_be_bytes());
     key[8..].copy_from_slice(&(shift as u64).to_be_bytes());
     key
+}
+
+fn key_shard(key: &[u8]) -> usize {
+    key.iter().fold(0x811c_9dc5u32, |hash, byte| {
+        (hash ^ u32::from(*byte)).wrapping_mul(0x0100_0193)
+    }) as usize
+        & (SHARD_COUNT - 1)
+}
+
+fn index_shard(key: &[u8; 16]) -> usize {
+    key_shard(key)
+}
+
+fn node_shard(node_id: u64) -> usize {
+    (node_id & ((1 << SHARD_BITS) - 1)) as usize
+}
+
+fn shard_path(path: &Path, shard: usize) -> std::path::PathBuf {
+    path.join(format!("shard-{shard:03}"))
+}
+
+fn shared_rocksdb_resources() -> &'static (Cache, WriteBufferManager) {
+    static RESOURCES: OnceLock<(Cache, WriteBufferManager)> = OnceLock::new();
+    RESOURCES.get_or_init(|| {
+        let cache = Cache::new_lru_cache(SHARED_CACHE_SIZE);
+        let write_buffer_manager = WriteBufferManager::new_write_buffer_manager_with_cache(
+            SHARED_WRITE_BUFFER_SIZE,
+            false,
+            cache.clone(),
+        );
+        (cache, write_buffer_manager)
+    })
 }
 
 fn target_prefix(depth: usize) -> [u8; 2] {
@@ -90,7 +130,7 @@ fn cf<'a>(db: &'a DB, name: &str) -> Result<&'a rocksdb::ColumnFamily, String> {
 
 #[derive(Clone)]
 pub struct ShiftPathStore {
-    db: Arc<DB>,
+    dbs: Arc<Vec<DB>>,
     depth: usize,
     pending_appends: Arc<Mutex<PendingAppends>>,
     /// 深さごとの次に払い出す連番 (index = depth)
@@ -107,19 +147,40 @@ impl ShiftPathStore {
         let mut options = Options::default();
         options.create_if_missing(true);
         options.create_missing_column_families(true);
-        let descriptors = [CF_NODES, CF_INDEX, CF_TARGETS, CF_META]
-            .map(|name| ColumnFamilyDescriptor::new(name, Options::default()));
-        let db = DB::open_cf_descriptors(&options, path, descriptors).map_err(err)?;
-
-        check_config_hash(&db, depth, config_hash)?;
-        if clear_existing {
-            clear_targets(&db, depth)?;
+        let (block_cache, write_buffer_manager) = shared_rocksdb_resources();
+        let mut block_options = BlockBasedOptions::default();
+        block_options.set_block_cache(block_cache);
+        options.set_block_based_table_factory(&block_options);
+        options.set_write_buffer_manager(write_buffer_manager);
+        if path.join("CURRENT").exists() {
+            return Err(format!(
+                "既存の単一 RocksDB は自動移行されません。バックアップ後に {} を別名へ移動してください",
+                path.display()
+            ));
         }
-        store_config_hash(&db, depth, config_hash)?;
-        let next_seq = load_next_seq(&db)?;
+        std::fs::create_dir_all(path).map_err(err)?;
+        let dbs = (0..SHARD_COUNT)
+            .map(|shard| {
+                let descriptors = [CF_NODES, CF_INDEX, CF_TARGETS, CF_META].map(|name| {
+                    let mut cf_options = Options::default();
+                    cf_options.set_block_based_table_factory(&block_options);
+                    cf_options.set_write_buffer_manager(write_buffer_manager);
+                    ColumnFamilyDescriptor::new(name, cf_options)
+                });
+                DB::open_cf_descriptors(&options, shard_path(path, shard), descriptors).map_err(err)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let dbs = Arc::new(dbs);
+
+        check_config_hash(&dbs[0], depth, config_hash)?;
+        if clear_existing {
+            clear_targets(&dbs, depth)?;
+        }
+        store_config_hash(&dbs[0], depth, config_hash)?;
+        let next_seq = load_next_seq(&dbs)?;
 
         Ok(Self {
-            db: Arc::new(db),
+            dbs,
             depth,
             pending_appends: Arc::new(Mutex::new(Vec::new())),
             next_seq: Arc::new(Mutex::new(next_seq)),
@@ -164,9 +225,6 @@ impl ShiftPathStore {
             .lock()
             .map_err(|_| "RocksDB 出力のロック取得に失敗しました".to_string())?;
 
-        let nodes_cf = cf(&self.db, CF_NODES)?;
-        let index_cf = cf(&self.db, CF_INDEX)?;
-
         // バッチ内の書き込みは未コミットなので、オーバーレイで管理する
         let mut next_seq = counters.clone();
         let mut touched: HashMap<u64, NodeRecord> = HashMap::new();
@@ -182,12 +240,15 @@ impl ShiftPathStore {
             let mut parent_node_id: Option<u64> = None;
             for (depth, &shift) in (1..).zip(path.iter()) {
                 let key = index_key(parent_node_id, shift);
+                let shard = index_shard(&key);
+                let index_db = &self.dbs[shard];
+                let index_cf = cf(index_db, CF_INDEX)?;
                 let node_id = if let Some(&id) = new_index.get(&key) {
                     id
-                } else if let Some(value) = self.db.get_cf(index_cf, key).map_err(err)? {
+                } else if let Some(value) = index_db.get_cf(index_cf, key).map_err(err)? {
                     decode_u64(&value)?
                 } else {
-                    let id = make_node_id(depth, next_seq[depth]);
+                    let id = make_node_id(depth, next_seq[depth], shard);
                     next_seq[depth] += 1;
                     touched.insert(
                         id,
@@ -209,25 +270,39 @@ impl ShiftPathStore {
             if let Some(record) = touched.get_mut(&leaf_id) {
                 record.score = *max_count;
             } else {
-                let mut record = read_node(&self.db, leaf_id)?
+                let mut record = read_node(&self.dbs, leaf_id)?
                     .ok_or_else(|| format!("node_id {leaf_id} がありません"))?;
                 record.score = *max_count;
                 touched.insert(leaf_id, record);
             }
         }
 
-        let mut batch = WriteBatch::default();
+        let mut batches: Vec<WriteBatch> =
+            (0..SHARD_COUNT).map(|_| WriteBatch::default()).collect();
+        let mut has_writes = vec![false; SHARD_COUNT];
         for (node_id, record) in &touched {
-            batch.put_cf(
+            let shard = node_shard(*node_id);
+            let nodes_cf = cf(&self.dbs[shard], CF_NODES)?;
+            batches[shard].put_cf(
                 nodes_cf,
                 node_id.to_be_bytes(),
                 serde_json::to_vec(record).map_err(err)?,
             );
+            has_writes[shard] = true;
         }
         for (key, node_id) in &new_index {
-            batch.put_cf(index_cf, key, node_id.to_be_bytes());
+            let shard = index_shard(key);
+            let index_cf = cf(&self.dbs[shard], CF_INDEX)?;
+            batches[shard].put_cf(index_cf, key, node_id.to_be_bytes());
+            has_writes[shard] = true;
         }
-        self.db.write(batch).map_err(err)?;
+        for shard in 0..SHARD_COUNT {
+            if has_writes[shard] {
+                self.dbs[shard]
+                    .write(std::mem::take(&mut batches[shard]))
+                    .map_err(err)?;
+            }
+        }
 
         // コミット成功後にだけ状態を進める
         *counters = next_seq;
@@ -237,28 +312,29 @@ impl ShiftPathStore {
 
     pub fn append_target(&self, target_count: usize, path: &[usize]) -> Result<(), String> {
         let target_shifts = serde_json::to_string(path).map_err(err)?;
-        let targets_cf = cf(&self.db, CF_TARGETS)?;
         let key = target_key(self.depth, &target_shifts);
+        let shard = key_shard(&key);
+        let db = &self.dbs[shard];
+        let targets_cf = cf(db, CF_TARGETS)?;
         // INSERT OR IGNORE 相当: 既にあれば何もしない
-        if self.db.get_cf(targets_cf, &key).map_err(err)?.is_none() {
-            self.db
-                .put_cf(targets_cf, &key, (target_count as u64).to_be_bytes())
+        if db.get_cf(targets_cf, &key).map_err(err)?.is_none() {
+            db.put_cf(targets_cf, &key, (target_count as u64).to_be_bytes())
                 .map_err(err)?;
         }
         Ok(())
     }
 
     pub fn set_search_complete(&self, complete: bool) -> Result<(), String> {
-        let meta_cf = cf(&self.db, CF_META)?;
-        self.db
-            .put_cf(meta_cf, completion_key(self.depth), [u8::from(complete)])
+        let db = &self.dbs[0];
+        let meta_cf = cf(db, CF_META)?;
+        db.put_cf(meta_cf, completion_key(self.depth), [u8::from(complete)])
             .map_err(err)
     }
 
     pub fn is_search_complete(&self) -> Result<bool, String> {
-        let meta_cf = cf(&self.db, CF_META)?;
-        match self
-            .db
+        let db = &self.dbs[0];
+        let meta_cf = cf(db, CF_META)?;
+        match db
             .get_cf(meta_cf, completion_key(self.depth))
             .map_err(err)?
         {
@@ -278,6 +354,19 @@ impl ShiftPathStore {
         self.load_leaf_paths(depth, None)
     }
 
+    pub fn count_depth_paths(&self, depth: usize) -> Result<u64, String> {
+        self.flush()?;
+        if depth == 0 || depth > MAX_DEPTH {
+            return Ok(0);
+        }
+
+        let next_seq = self
+            .next_seq
+            .lock()
+            .map_err(|_| "RocksDB 出力のロック取得に失敗しました".to_string())?;
+        Ok(next_seq[depth] - 1)
+    }
+
     /// 指定深さの葉を node_id 順に最大 `limit` 件返す。
     ///
     /// `after_node_id` を指定した場合は、その直後のノードから読み始める。
@@ -292,31 +381,37 @@ impl ShiftPathStore {
             return Ok(Vec::new());
         }
 
-        let nodes_cf = cf(&self.db, CF_NODES)?;
-        let start_node_id = after_node_id.unwrap_or_else(|| make_node_id(depth, 0));
-        let start = start_node_id.to_be_bytes();
-        let mut leaf_ids = Vec::with_capacity(limit);
-        let mut leaves = Vec::with_capacity(limit);
-        for item in self
-            .db
-            .iterator_cf(nodes_cf, IteratorMode::From(&start, Direction::Forward))
-        {
-            let (key, value) = item.map_err(err)?;
-            let node_id = decode_u64(&key)?;
-            if node_depth(node_id) != depth {
-                break;
-            }
-            if after_node_id.is_some_and(|after| node_id <= after) {
-                continue;
-            }
-
-            leaf_ids.push(node_id);
-            leaves.push(serde_json::from_slice(&value).map_err(err)?);
-            if leaves.len() == limit {
-                break;
+        let mut candidates = Vec::with_capacity(limit.saturating_mul(SHARD_COUNT));
+        for (shard, db) in self.dbs.iter().enumerate() {
+            let nodes_cf = cf(db, CF_NODES)?;
+            let start_node_id = after_node_id
+                .unwrap_or_else(|| make_node_id(depth, 0, shard))
+                .to_be_bytes();
+            let mut shard_count = 0;
+            for item in db.iterator_cf(
+                nodes_cf,
+                IteratorMode::From(&start_node_id, Direction::Forward),
+            ) {
+                let (key, value) = item.map_err(err)?;
+                let node_id = decode_u64(&key)?;
+                if node_depth(node_id) != depth {
+                    break;
+                }
+                if after_node_id.is_some_and(|after| node_id <= after) {
+                    continue;
+                }
+                candidates.push((node_id, serde_json::from_slice(&value).map_err(err)?));
+                shard_count += 1;
+                if shard_count == limit {
+                    break;
+                }
             }
         }
 
+        candidates.sort_unstable_by_key(|(node_id, _)| *node_id);
+        candidates.truncate(limit);
+        let leaf_ids: Vec<_> = candidates.iter().map(|(node_id, _)| *node_id).collect();
+        let leaves = candidates.into_iter().map(|(_, record)| record).collect();
         let paths = self.reconstruct_leaf_paths(depth, leaves)?;
         Ok(leaf_ids.into_iter().zip(paths).collect())
     }
@@ -332,25 +427,24 @@ impl ShiftPathStore {
             return Ok(Vec::new());
         }
 
-        let nodes_cf = cf(&self.db, CF_NODES)?;
-        let start = make_node_id(depth, 0).to_be_bytes();
         let mut top = BinaryHeap::new();
-        for item in self
-            .db
-            .iterator_cf(nodes_cf, IteratorMode::From(&start, Direction::Forward))
-        {
-            let (key, value) = item.map_err(err)?;
-            let node_id = decode_u64(&key)?;
-            if node_depth(node_id) != depth {
-                break;
-            }
-            let record: NodeRecord = serde_json::from_slice(&value).map_err(err)?;
-            let candidate = (Reverse(record.score), node_id);
-            if top.len() < limit {
-                top.push(candidate);
-            } else if top.peek().is_some_and(|worst| candidate < *worst) {
-                top.pop();
-                top.push(candidate);
+        for (shard, db) in self.dbs.iter().enumerate() {
+            let nodes_cf = cf(db, CF_NODES)?;
+            let start = make_node_id(depth, 0, shard).to_be_bytes();
+            for item in db.iterator_cf(nodes_cf, IteratorMode::From(&start, Direction::Forward)) {
+                let (key, value) = item.map_err(err)?;
+                let node_id = decode_u64(&key)?;
+                if node_depth(node_id) != depth {
+                    break;
+                }
+                let record: NodeRecord = serde_json::from_slice(&value).map_err(err)?;
+                let candidate = (Reverse(record.score), node_id);
+                if top.len() < limit {
+                    top.push(candidate);
+                } else if top.peek().is_some_and(|worst| candidate < *worst) {
+                    top.pop();
+                    top.push(candidate);
+                }
             }
         }
 
@@ -366,7 +460,7 @@ impl ShiftPathStore {
         let records = leaves
             .iter()
             .map(|(_, node_id)| {
-                read_node(&self.db, *node_id)?
+                read_node(&self.dbs, *node_id)?
                     .ok_or_else(|| format!("node_id {node_id} がありません"))
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -411,7 +505,7 @@ impl ShiftPathStore {
                 let node_id =
                     parent_id.ok_or_else(|| format!("depth {depth} の親ノードが欠けています"))?;
                 if !cache.contains_key(&node_id) {
-                    let record = read_node(&self.db, node_id)?
+                    let record = read_node(&self.dbs, node_id)?
                         .ok_or_else(|| format!("node_id {node_id} がありません"))?;
                     cache.insert(node_id, record);
                 }
@@ -432,39 +526,40 @@ impl ShiftPathStore {
         if depth == 0 || depth > MAX_DEPTH {
             return Ok(Vec::new());
         }
-        let nodes_cf = cf(&self.db, CF_NODES)?;
-        let start = make_node_id(depth, 0).to_be_bytes();
         let mut nodes = Vec::new();
-        for item in self
-            .db
-            .iterator_cf(nodes_cf, IteratorMode::From(&start, Direction::Forward))
-        {
-            let (key, value) = item.map_err(err)?;
-            let node_id = decode_u64(&key)?;
-            if node_depth(node_id) != depth {
-                break;
+        for (shard, db) in self.dbs.iter().enumerate() {
+            let nodes_cf = cf(db, CF_NODES)?;
+            let start = make_node_id(depth, 0, shard).to_be_bytes();
+            for item in db.iterator_cf(nodes_cf, IteratorMode::From(&start, Direction::Forward)) {
+                let (key, value) = item.map_err(err)?;
+                let node_id = decode_u64(&key)?;
+                if node_depth(node_id) != depth {
+                    break;
+                }
+                nodes.push((node_id, serde_json::from_slice(&value).map_err(err)?));
             }
-            nodes.push((node_id, serde_json::from_slice(&value).map_err(err)?));
         }
+        nodes.sort_unstable_by_key(|(node_id, _)| *node_id);
         Ok(nodes)
     }
 
     #[allow(dead_code)] // Optional target-loading API.
     pub fn load_target_paths(&self) -> Result<Vec<Vec<usize>>, String> {
         self.flush()?;
-        let targets_cf = cf(&self.db, CF_TARGETS)?;
         let prefix = target_prefix(self.depth);
         let mut targets: Vec<(u64, Vec<usize>)> = Vec::new();
-        for item in self
-            .db
-            .iterator_cf(targets_cf, IteratorMode::From(&prefix, Direction::Forward))
-        {
-            let (key, value) = item.map_err(err)?;
-            if !key.starts_with(&prefix) {
-                break;
+        for db in self.dbs.iter() {
+            let targets_cf = cf(db, CF_TARGETS)?;
+            for item in db.iterator_cf(targets_cf, IteratorMode::From(&prefix, Direction::Forward))
+            {
+                let (key, value) = item.map_err(err)?;
+                if !key.starts_with(&prefix) {
+                    break;
+                }
+                let shifts: Vec<usize> =
+                    serde_json::from_slice(&key[prefix.len()..]).map_err(err)?;
+                targets.push((decode_u64(&value)?, shifts));
             }
-            let shifts: Vec<usize> = serde_json::from_slice(&key[prefix.len()..]).map_err(err)?;
-            targets.push((decode_u64(&value)?, shifts));
         }
         targets.sort_by_key(|(count, _)| *count); // 安定ソート
         Ok(targets.into_iter().map(|(_, shifts)| shifts).collect())
@@ -477,7 +572,8 @@ impl Drop for ShiftPathStore {
     }
 }
 
-fn read_node(db: &DB, node_id: u64) -> Result<Option<NodeRecord>, String> {
+fn read_node(dbs: &[DB], node_id: u64) -> Result<Option<NodeRecord>, String> {
+    let db = &dbs[node_shard(node_id)];
     let nodes_cf = cf(db, CF_NODES)?;
     match db.get_cf(nodes_cf, node_id.to_be_bytes()).map_err(err)? {
         Some(value) => Ok(Some(serde_json::from_slice(&value).map_err(err)?)),
@@ -486,35 +582,40 @@ fn read_node(db: &DB, node_id: u64) -> Result<Option<NodeRecord>, String> {
 }
 
 /// 各深さの最後の node_id を逆方向シークで調べ、次の連番を求める
-fn load_next_seq(db: &DB) -> Result<Vec<u64>, String> {
-    let nodes_cf = cf(db, CF_NODES)?;
+fn load_next_seq(dbs: &[DB]) -> Result<Vec<u64>, String> {
     let mut next_seq = vec![1u64; MAX_DEPTH + 1];
-    for (depth, slot) in next_seq.iter_mut().enumerate().skip(1) {
-        let upper = make_node_id(depth, SEQ_MASK).to_be_bytes();
-        let mut iter = db.iterator_cf(nodes_cf, IteratorMode::From(&upper, Direction::Reverse));
-        if let Some(item) = iter.next() {
-            let (key, _) = item.map_err(err)?;
-            let node_id = decode_u64(&key)?;
-            if node_depth(node_id) == depth {
-                *slot = (node_id & SEQ_MASK) + 1;
+    for (shard, db) in dbs.iter().enumerate() {
+        let nodes_cf = cf(db, CF_NODES)?;
+        for (depth, slot) in next_seq.iter_mut().enumerate().skip(1) {
+            let upper = make_node_id(depth, NODE_SEQ_MASK, shard).to_be_bytes();
+            let mut iter = db.iterator_cf(nodes_cf, IteratorMode::From(&upper, Direction::Reverse));
+            if let Some(item) = iter.next() {
+                let (key, _) = item.map_err(err)?;
+                let node_id = decode_u64(&key)?;
+                if node_depth(node_id) == depth {
+                    *slot = (*slot).max(((node_id & SEQ_MASK) >> SHARD_BITS) + 1);
+                }
             }
         }
     }
     Ok(next_seq)
 }
 
-fn clear_targets(db: &DB, depth: usize) -> Result<(), String> {
-    let targets_cf = cf(db, CF_TARGETS)?;
+fn clear_targets(dbs: &[DB], depth: usize) -> Result<(), String> {
     let prefix = target_prefix(depth);
-    let mut batch = WriteBatch::default();
-    for item in db.iterator_cf(targets_cf, IteratorMode::From(&prefix, Direction::Forward)) {
-        let (key, _) = item.map_err(err)?;
-        if !key.starts_with(&prefix) {
-            break;
+    for db in dbs {
+        let targets_cf = cf(db, CF_TARGETS)?;
+        let mut batch = WriteBatch::default();
+        for item in db.iterator_cf(targets_cf, IteratorMode::From(&prefix, Direction::Forward)) {
+            let (key, _) = item.map_err(err)?;
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            batch.delete_cf(targets_cf, key);
         }
-        batch.delete_cf(targets_cf, key);
+        db.write(batch).map_err(err)?;
     }
-    db.write(batch).map_err(err)
+    Ok(())
 }
 
 fn check_config_hash(db: &DB, depth: usize, config_hash: u64) -> Result<(), String> {
@@ -539,7 +640,7 @@ fn store_config_hash(db: &DB, depth: usize, config_hash: u64) -> Result<(), Stri
 
 #[cfg(test)]
 mod tests {
-    use super::{NodeRecord, ShiftPathStore};
+    use super::{node_shard, NodeRecord, ShiftPathStore, SHARD_COUNT};
 
     fn database_path() -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
@@ -636,6 +737,16 @@ mod tests {
         store
             .append_batch((0..501).map(|shift| (1, vec![shift])).collect())
             .unwrap();
+
+        assert_eq!(std::fs::read_dir(&path).unwrap().count(), SHARD_COUNT);
+        assert_eq!(store.count_depth_paths(1).unwrap(), 501);
+        let used_shards: std::collections::HashSet<_> = store
+            .load_nodes(1)
+            .unwrap()
+            .into_iter()
+            .map(|(node_id, _)| node_shard(node_id))
+            .collect();
+        assert!(used_shards.len() > 1);
 
         let first = store.load_full_depth_paths_batch(1, None, 500).unwrap();
         assert_eq!(first.len(), 500);

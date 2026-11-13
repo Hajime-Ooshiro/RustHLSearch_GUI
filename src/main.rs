@@ -770,8 +770,12 @@ impl App for AppState {
                 ui.horizontal(|ui| {
                     ui.spinner();
                     ui.label(format!(
-                        "検索中: ノード={} 最良={} ヒット={}",
-                        progress.node_count, progress.max_score, progress.results
+                        "検索中: ノード={} 最良={} ヒット={} prefix={}/{}",
+                        progress.node_count,
+                        progress.max_score,
+                        progress.results,
+                        progress.prefix_done,
+                        progress.prefix_total
                     ));
                 });
                 ui.label(format!("経過時間: {:?}", self.start_time.elapsed()));

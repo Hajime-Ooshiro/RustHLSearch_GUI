@@ -119,6 +119,8 @@ pub struct SearchProgress {
     max_score: AtomicUsize,
     results: AtomicUsize,
     depth: AtomicUsize,
+    prefix_done: AtomicU64,
+    prefix_total: AtomicU64,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -127,6 +129,8 @@ pub struct SearchProgressSnapshot {
     pub max_score: usize,
     pub results: usize,
     pub depth: usize,
+    pub prefix_done: u64,
+    pub prefix_total: u64,
 }
 
 impl SearchProgress {
@@ -136,6 +140,8 @@ impl SearchProgress {
             max_score: self.max_score.load(Ordering::Relaxed),
             results: self.results.load(Ordering::Relaxed),
             depth: self.depth.load(Ordering::Relaxed),
+            prefix_done: self.prefix_done.load(Ordering::Relaxed),
+            prefix_total: self.prefix_total.load(Ordering::Relaxed),
         }
     }
 
@@ -148,6 +154,15 @@ impl SearchProgress {
 
     fn add_nodes(&self, nodes: u64) {
         self.node_count.fetch_add(nodes, Ordering::Relaxed);
+    }
+
+    fn set_prefix_total(&self, total: u64) {
+        self.prefix_done.store(0, Ordering::Relaxed);
+        self.prefix_total.store(total, Ordering::Relaxed);
+    }
+
+    fn add_prefix_done(&self, prefixes: u64) {
+        self.prefix_done.fetch_add(prefixes, Ordering::Relaxed);
     }
 }
 
@@ -398,6 +413,12 @@ impl State {
         self.shifts.clear();
         self.target_count = 0;
         self.target_shifts.clear();
+        if let Some(reporter) = self.progress_reporter.as_ref() {
+            let total = store
+                .count_depth_paths(depth - 1)
+                .map_err(std::io::Error::other)?;
+            reporter.set_prefix_total(total);
+        }
         Self::update_progress(
             self.progress_reporter.as_deref(),
             self.node_count,
@@ -433,6 +454,7 @@ impl State {
                 ));
             };
             after_node_id = Some(*last_node_id);
+            let prefix_count = batch.len() as u64;
 
             let frontier: Vec<_> = batch
                 .into_iter()
@@ -502,6 +524,9 @@ impl State {
             self.submit_shift_path_batch(&mut pending_appends)
                 .map_err(std::io::Error::other)?;
             store.flush().map_err(std::io::Error::other)?;
+            if let Some(reporter) = self.progress_reporter.as_ref() {
+                reporter.add_prefix_done(prefix_count);
+            }
             Self::update_progress(
                 self.progress_reporter.as_deref(),
                 self.node_count,
@@ -1188,6 +1213,8 @@ mod tests {
                 max_score: 450,
                 results: 7,
                 depth: 4,
+                prefix_done: 0,
+                prefix_total: 0,
             }
         );
     }
