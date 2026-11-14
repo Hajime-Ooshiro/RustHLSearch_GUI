@@ -94,6 +94,8 @@ struct Checkpoint {
     beam_next_shift: usize,
     #[serde(default)]
     beam_saved_prefix_batches: bool,
+    #[serde(default)]
+    beam_next_frontier_checkpointed: bool,
 }
 
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, clap::ValueEnum, Deserialize, Serialize)]
@@ -625,8 +627,23 @@ impl State {
             let frontier = checkpoint.beam_frontier.ok_or(
                     "Checkpoint predates beam search and cannot be resumed; use a different --output-dir",
                 )?;
-            let next_frontier = if self.shift_path_store.is_some() && checkpoint.beam_level < depth
-            {
+            let next_frontier = if checkpoint.beam_next_frontier_checkpointed {
+                if checkpoint.beam_level < depth {
+                    if let Some(store) = &self.shift_path_store {
+                        store
+                            .replace_depth_paths(
+                                checkpoint.beam_level + 1,
+                                &checkpoint
+                                    .beam_next_frontier
+                                    .iter()
+                                    .map(|candidate| (candidate.score, candidate.key.clone()))
+                                    .collect::<Vec<_>>(),
+                            )
+                            .map_err(std::io::Error::other)?;
+                    }
+                }
+                checkpoint.beam_next_frontier
+            } else if self.shift_path_store.is_some() && checkpoint.beam_level < depth {
                 self.load_candidates_from_store(checkpoint.beam_level + 1)
                     .map_err(std::io::Error::other)?
             } else {
@@ -685,11 +702,7 @@ impl State {
                     depth,
                     &frontier,
                     level,
-                    if self.shift_path_store.is_some() {
-                        Vec::new()
-                    } else {
-                        candidates.clone()
-                    },
+                    candidates.clone(),
                     next_index,
                     next_shift,
                 )?;
@@ -733,6 +746,7 @@ impl State {
                 self.submit_shift_path_batch(&mut pending_appends)
                     .map_err(std::io::Error::other)?;
                 frontier = if self.shift_path_store.is_some() {
+                    candidates.clear();
                     self.load_candidates_from_store(level)
                         .map_err(std::io::Error::other)?
                 } else {
@@ -783,14 +797,16 @@ impl State {
             if score >= self.target {
                 let mut key = frontier[next_index].key.clone();
                 key.push(shift);
+                candidates.push(BeamCandidate {
+                    key: key.clone(),
+                    score,
+                });
                 if self.shift_path_store.is_some() {
                     pending_appends.push((score, key.clone()));
                     if pending_appends.len() >= SHIFT_PATH_BATCH_SIZE {
                         self.submit_shift_path_batch(&mut pending_appends)
                             .map_err(std::io::Error::other)?;
                     }
-                } else {
-                    candidates.push(BeamCandidate { key, score });
                 }
             }
 
@@ -816,11 +832,7 @@ impl State {
                     depth,
                     &frontier,
                     level,
-                    if self.shift_path_store.is_some() {
-                        Vec::new()
-                    } else {
-                        candidates.clone()
-                    },
+                    candidates.clone(),
                     next_index,
                     next_shift,
                 )?;
@@ -869,6 +881,7 @@ impl State {
                 beam_next_index: next_index,
                 beam_next_shift: next_shift,
                 beam_saved_prefix_batches: false,
+                beam_next_frontier_checkpointed: true,
             },
         )
     }
@@ -905,6 +918,7 @@ impl State {
                 beam_next_index: 0,
                 beam_next_shift: 0,
                 beam_saved_prefix_batches: true,
+                beam_next_frontier_checkpointed: false,
             },
         )
     }
@@ -1047,13 +1061,24 @@ impl State {
                 .into());
             }
             self.apply_checkpoint_config(&checkpoint, depth)?;
+            let frontier = checkpoint.beam_frontier.ok_or(
+                "Checkpoint predates beam search and cannot be resumed; use a different --output-dir",
+            )?;
+            if checkpoint.beam_next_frontier_checkpointed && checkpoint.beam_level > 0 {
+                if let Some(store) = &self.shift_path_store {
+                    store
+                        .replace_depth_paths(
+                            checkpoint.beam_level,
+                            &frontier
+                                .iter()
+                                .map(|candidate| (candidate.score, candidate.key.clone()))
+                                .collect::<Vec<_>>(),
+                        )
+                        .map_err(std::io::Error::other)?;
+                }
+            }
             self.node_count = checkpoint.node_count;
-            (
-                checkpoint.beam_frontier.ok_or(
-                    "Checkpoint predates beam search and cannot be resumed; use a different --output-dir",
-                )?,
-                checkpoint.beam_level,
-            )
+            (frontier, checkpoint.beam_level)
         } else {
             (
                 vec![BeamCandidate {
@@ -1561,6 +1586,7 @@ mod tests {
                     beam_next_index: 0,
                     beam_next_shift: 1,
                     beam_saved_prefix_batches: false,
+                    beam_next_frontier_checkpointed: true,
                 },
             )
             .unwrap();
@@ -1579,6 +1605,72 @@ mod tests {
         let backup_path = path.with_extension("bak");
         let _ = std::fs::remove_file(path);
         let _ = std::fs::remove_file(backup_path);
+    }
+
+    #[test]
+    fn beam_checkpoint_replaces_inconsistent_database_candidates() {
+        let primes = vec![2, 3];
+        let cols = 4;
+        let depth = 2;
+        let path = unique_checkpoint_path("beam-db-recovery");
+        let database_path = path.with_extension("rocksdb");
+        let mut state = State::new(primes.clone(), cols, build_shift_table(&primes, cols));
+        state.target = 0;
+        state
+            .set_shift_path_store(&database_path, depth, true)
+            .unwrap();
+        state
+            .shift_path_store
+            .as_ref()
+            .unwrap()
+            .append(1, &[0])
+            .unwrap();
+        state
+            .write_checkpoint_file(
+                &path,
+                &super::Checkpoint {
+                    mode: super::SearchMode::Sequential,
+                    depth,
+                    stack: Vec::new(),
+                    key: Vec::new(),
+                    max_score: 0,
+                    results: 0,
+                    target_count: 0,
+                    node_count: 2,
+                    split_depth: 0,
+                    completed: Vec::new(),
+                    in_progress: Vec::new(),
+                    pending_prefixes: Vec::new(),
+                    work_prefixes: None,
+                    config_hash: state.compute_config_hash(),
+                    beam_frontier: Some(vec![super::BeamCandidate {
+                        key: Vec::new(),
+                        score: cols,
+                    }]),
+                    beam_level: 0,
+                    beam_next_frontier: vec![super::BeamCandidate {
+                        key: vec![1],
+                        score: 2,
+                    }],
+                    beam_next_index: 1,
+                    beam_next_shift: 0,
+                    beam_saved_prefix_batches: false,
+                    beam_next_frontier_checkpointed: true,
+                },
+            )
+            .unwrap();
+
+        state
+            .search_with_checkpoint(depth, Some(&path), Some(&path))
+            .unwrap();
+        let store = state.shift_path_store.as_ref().unwrap();
+        assert_eq!(store.load_full_depth_paths(1).unwrap(), vec![vec![1]]);
+
+        drop(state);
+        let backup_path = path.with_extension("bak");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(backup_path);
+        std::fs::remove_dir_all(database_path).unwrap();
     }
 
     fn unique_checkpoint_path(label: &str) -> std::path::PathBuf {

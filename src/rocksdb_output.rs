@@ -212,6 +212,61 @@ impl ShiftPathStore {
         Ok(())
     }
 
+    pub fn replace_depth_paths(
+        &self,
+        depth: usize,
+        paths: &[(usize, Vec<usize>)],
+    ) -> Result<(), String> {
+        if depth == 0 || depth > self.depth || depth > MAX_DEPTH {
+            return Err(format!("置き換え対象の深さが不正です: {depth}"));
+        }
+        if paths.iter().any(|(_, path)| path.len() != depth) {
+            return Err(format!("深さ {depth} と異なるパスが含まれています"));
+        }
+        self.flush()?;
+
+        let mut removed_node_ids_by_shard = vec![Vec::new(); self.dbs.len()];
+        for (shard, db) in self.dbs.iter().enumerate() {
+            let nodes_cf = cf(db, CF_NODES)?;
+            for item in db.iterator_cf(nodes_cf, IteratorMode::Start) {
+                let (key, _) = item.map_err(err)?;
+                let node_id = decode_u64(&key)?;
+                if node_depth(node_id) >= depth {
+                    removed_node_ids_by_shard[shard].push(node_id);
+                }
+            }
+        }
+
+        for (shard, db) in self.dbs.iter().enumerate() {
+            let nodes_cf = cf(db, CF_NODES)?;
+            let index_cf = cf(db, CF_INDEX)?;
+            let mut batch = WriteBatch::default();
+            for node_id in &removed_node_ids_by_shard[shard] {
+                batch.delete_cf(nodes_cf, node_id.to_be_bytes());
+            }
+            for item in db.iterator_cf(index_cf, IteratorMode::Start) {
+                let (key, value) = item.map_err(err)?;
+                if node_depth(decode_u64(&value)?) >= depth {
+                    batch.delete_cf(index_cf, key);
+                }
+            }
+            db.write(batch).map_err(err)?;
+        }
+        clear_targets(&self.dbs, self.depth)?;
+        let meta_cf = cf(&self.dbs[0], CF_META)?;
+        self.dbs[0]
+            .put_cf(meta_cf, completion_key(self.depth), [0])
+            .map_err(err)?;
+        *self
+            .next_seq
+            .lock()
+            .map_err(|_| "RocksDB 出力のロック取得に失敗しました".to_string())? =
+            load_next_seq(&self.dbs)?;
+
+        self.append_batch(paths.to_vec())?;
+        self.flush()
+    }
+
     pub fn flush(&self) -> Result<(), String> {
         let mut buffer = self
             .pending_appends
