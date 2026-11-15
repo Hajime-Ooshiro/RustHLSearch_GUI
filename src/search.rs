@@ -9,9 +9,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 const SHIFT_PATH_BATCH_SIZE: usize = 256;
-const PREVIOUS_DEPTH_BATCH_SIZE: usize = 500;
+const PREVIOUS_DEPTH_BATCH_SIZE: usize = 210;
 const PROGRESS_UPDATE_NODE_INTERVAL: u64 = 256;
-const BEAM_POLICY_VERSION: u64 = 2;
+const BEAM_WIDTH: usize = 210;
+const BEAM_POLICY_VERSION: u64 = 3;
 
 /// 基底行の生成と補集合シフトテーブルの作成
 pub fn build_shift_table(primes: &[usize], cols: usize) -> Vec<Vec<BitMask>> {
@@ -311,6 +312,16 @@ impl State {
         store.flush()
     }
 
+    fn limit_beam_width(candidates: &mut Vec<BeamCandidate>) {
+        candidates.sort_unstable_by(|left, right| {
+            right
+                .score
+                .cmp(&left.score)
+                .then_with(|| left.key.cmp(&right.key))
+        });
+        candidates.truncate(BEAM_WIDTH);
+    }
+
     fn evaluate_frontier_parallel(
         &self,
         frontier: &[BeamCandidate],
@@ -465,7 +476,7 @@ impl State {
                     (score >= self.target).then_some(BeamCandidate { key, score })
                 })
                 .collect();
-            let candidates = match mode {
+            let mut candidates = match mode {
                 SearchMode::Sequential => {
                     let mut candidates = Vec::new();
                     for candidate in &frontier {
@@ -511,6 +522,7 @@ impl State {
                     candidates
                 }
             };
+            Self::limit_beam_width(&mut candidates);
 
             for candidate in candidates {
                 self.aggregate_target_result(depth, candidate.score, &candidate.key)
@@ -745,6 +757,18 @@ impl State {
                 level += 1;
                 self.submit_shift_path_batch(&mut pending_appends)
                     .map_err(std::io::Error::other)?;
+                Self::limit_beam_width(&mut candidates);
+                if let Some(store) = &self.shift_path_store {
+                    store
+                        .replace_depth_paths(
+                            level,
+                            &candidates
+                                .iter()
+                                .map(|candidate| (candidate.score, candidate.key.clone()))
+                                .collect::<Vec<_>>(),
+                        )
+                        .map_err(std::io::Error::other)?;
+                }
                 frontier = if self.shift_path_store.is_some() {
                     candidates.clear();
                     self.load_candidates_from_store(level)
@@ -1148,7 +1172,7 @@ impl State {
                 return Ok((results, true));
             }
 
-            let Some((nodes, candidates)) =
+            let Some((nodes, mut candidates)) =
                 self.evaluate_frontier_parallel(&frontier, level, interrupted)
             else {
                 self.write_beam_checkpoint(
@@ -1164,6 +1188,7 @@ impl State {
                 return Ok((SharedResults::default(), false));
             };
             self.node_count += nodes;
+            Self::limit_beam_width(&mut candidates);
             self.persist_candidates(&candidates)
                 .map_err(std::io::Error::other)?;
 
@@ -1303,17 +1328,25 @@ mod tests {
     }
 
     #[test]
-    fn beam_search_expands_all_candidates_at_each_level() {
+    fn beam_search_limits_candidates_at_each_level() {
         let primes = vec![23, 23, 2];
         let cols = 529;
         let table = build_shift_table(&primes, cols);
-        let mut state = State::new(primes, cols, table);
-        state.target = 0;
+        let mut sequential = State::new(primes.clone(), cols, table.clone());
+        sequential.target = 0;
+        sequential.search_with_checkpoint(3, None, None).unwrap();
 
-        state.search_with_checkpoint(3, None, None).unwrap();
+        let mut parallel = State::new(primes, cols, table);
+        parallel.target = 0;
+        let parallel_result = parallel.search_parallel(3, None, None).unwrap();
 
-        assert_eq!(state.node_count, (23 + 23 * 23 + 23 * 23 * 2) as u64);
-        assert!(state.shifts.iter().all(|path| path.len() == 3));
+        let expected_node_count = (23 + 23 * 23 + 210 * 2) as u64;
+        assert_eq!(sequential.node_count, expected_node_count);
+        assert_eq!(parallel.node_count, expected_node_count);
+        assert_eq!(parallel_result.max_score, sequential.max_score);
+        assert_eq!(parallel_result.results, sequential.results);
+        assert!(sequential.shifts.iter().all(|path| path.len() == 3));
+        assert!(parallel_result.shifts.iter().all(|path| path.len() == 3));
     }
 
     #[test]

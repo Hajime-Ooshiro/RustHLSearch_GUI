@@ -434,7 +434,9 @@ fn japanese_font_path() -> io::Result<PathBuf> {
 
 fn japanese_font_definitions(font_data: egui::FontData) -> egui::FontDefinitions {
     let mut fonts = egui::FontDefinitions::default();
-    fonts.font_data.insert("Japanese".to_owned(), font_data);
+    fonts
+        .font_data
+        .insert("Japanese".to_owned(), font_data.into());
     for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
         fonts
             .families
@@ -447,12 +449,13 @@ fn japanese_font_definitions(font_data: egui::FontData) -> egui::FontDefinitions
 
 fn has_japanese_ui_glyphs(ctx: &egui::Context, font_definitions: &egui::FontDefinitions) -> bool {
     let mut has_glyphs = false;
-    let _ = ctx.run(egui::RawInput::default(), |ctx| {
+    let _ = ctx.run_ui(egui::RawInput::default(), |ctx| {
         ctx.set_fonts(font_definitions.clone());
     });
-    let _ = ctx.run(egui::RawInput::default(), |ctx| {
-        has_glyphs = ctx
-            .fonts(|fonts| fonts.has_glyphs(&egui::FontId::proportional(14.0), "日本語の表示確認"));
+    let _ = ctx.run_ui(egui::RawInput::default(), |ctx| {
+        has_glyphs = ctx.fonts_mut(|fonts| {
+            fonts.has_glyphs(&egui::FontId::proportional(14.0), "日本語の表示確認")
+        });
     });
     has_glyphs
 }
@@ -684,7 +687,7 @@ fn show_search_tree(ui: &mut egui::Ui, nodes: &[TreeNode]) {
 }
 
 impl App for AppState {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if self
             .search_thread
             .as_ref()
@@ -696,12 +699,14 @@ impl App for AppState {
         if self.is_searching {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
+    }
 
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let mut search_requested = false;
-        egui::TopBottomPanel::top("top_view")
-            .default_height(60.0)
+        egui::Panel::top("top_view")
+            .default_size(60.0)
             .resizable(true)
-            .show(ctx, |ui| {
+            .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.heading("探索設定");
                     ui.separator();
@@ -719,10 +724,10 @@ impl App for AppState {
                 }
             });
 
-        egui::TopBottomPanel::bottom("bottom_view")
-            .default_height(120.0)
+        egui::Panel::bottom("bottom_view")
+            .default_size(120.0)
             .resizable(true)
-            .show(ctx, |ui| {
+            .show(ui, |ui| {
                 ui.heading("ログ");
                 ui.separator();
 
@@ -756,7 +761,7 @@ impl App for AppState {
             }
         }
 
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default().show(ui, |ui| {
             ui.heading("探索結果");
             if self.is_searching {
                 let progress = self.search_progress.snapshot();
@@ -844,7 +849,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_inner_size([1200.0, 800.0]),
-        renderer: eframe::Renderer::Wgpu,
+        renderer: eframe::Renderer::Glow,
         ..Default::default()
     };
 
@@ -866,7 +871,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 search_thread: None,
                 is_searching: false,
             };
-            Box::new(app)
+            Ok(Box::new(app) as Box<dyn eframe::App>)
         }),
     )
     .map_err(|e| {
