@@ -22,7 +22,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 const MAX_DEPTH: usize = 249;
 const APPEND_BATCH_SIZE: usize = 4096;
-const SHARD_COUNT: usize = 256;
+const SHARD_COUNT: usize = 210;
 const SHARED_CACHE_SIZE: usize = 32 * 1024 * 1024;
 const SHARED_WRITE_BUFFER_SIZE: usize = 128 * 1024 * 1024;
 const SHARD_BITS: u32 = 8;
@@ -77,7 +77,7 @@ fn key_shard(key: &[u8]) -> usize {
     key.iter().fold(0x811c_9dc5u32, |hash, byte| {
         (hash ^ u32::from(*byte)).wrapping_mul(0x0100_0193)
     }) as usize
-        & (SHARD_COUNT - 1)
+        % SHARD_COUNT
 }
 
 fn index_shard(key: &[u8; 16]) -> usize {
@@ -155,6 +155,12 @@ impl ShiftPathStore {
         if path.join("CURRENT").exists() {
             return Err(format!(
                 "既存の単一 RocksDB は自動移行されません。バックアップ後に {} を別名へ移動してください",
+                path.display()
+            ));
+        }
+        if shard_path(path, SHARD_COUNT).exists() {
+            return Err(format!(
+                "256シャード構成の RocksDB は自動移行されません。バックアップ後に {} を別名へ移動してください",
                 path.display()
             ));
         }
