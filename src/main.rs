@@ -297,6 +297,7 @@ struct TreeNode {
     score: Option<usize>,
     children: Vec<usize>,
     y: f32,
+    is_max_score_path: bool,
 }
 
 fn build_search_tree(paths: &[Vec<usize>], path_scores: &[usize]) -> Vec<TreeNode> {
@@ -307,6 +308,7 @@ fn build_search_tree(paths: &[Vec<usize>], path_scores: &[usize]) -> Vec<TreeNod
         score: None,
         children: Vec::new(),
         y: 0.0,
+        is_max_score_path: false,
     }];
     let mut child_indices = HashMap::new();
 
@@ -323,6 +325,7 @@ fn build_search_tree(paths: &[Vec<usize>], path_scores: &[usize]) -> Vec<TreeNod
                     score: None,
                     children: Vec::new(),
                     y: 0.0,
+                    is_max_score_path: false,
                 });
                 nodes[parent].children.push(child);
                 child
@@ -336,7 +339,26 @@ fn build_search_tree(paths: &[Vec<usize>], path_scores: &[usize]) -> Vec<TreeNod
 
     let mut next_leaf = 0;
     assign_tree_y(&mut nodes, 0, &mut next_leaf);
+    mark_max_score_paths(&mut nodes);
     nodes
+}
+
+fn mark_max_score_paths(nodes: &mut [TreeNode]) {
+    let Some(max_score) = nodes.iter().filter_map(|node| node.score).max() else {
+        return;
+    };
+
+    for leaf_index in 0..nodes.len() {
+        if nodes[leaf_index].score != Some(max_score) {
+            continue;
+        }
+
+        let mut node_index = Some(leaf_index);
+        while let Some(index) = node_index {
+            nodes[index].is_max_score_path = true;
+            node_index = nodes[index].parent;
+        }
+    }
 }
 
 fn assign_tree_y(nodes: &mut [TreeNode], index: usize, next_leaf: &mut usize) -> f32 {
@@ -659,14 +681,29 @@ fn show_search_tree(ui: &mut egui::Ui, nodes: &[TreeNode]) {
                             ),
                             egui::pos2(x_for_depth(node.depth) - 9.0, rect.top() + node.y),
                         ],
-                        egui::Stroke::new(1.0_f32, egui::Color32::from_gray(110)),
+                        egui::Stroke::new(
+                            if node.is_max_score_path { 2.0 } else { 1.0 },
+                            if node.is_max_score_path {
+                                egui::Color32::RED
+                            } else {
+                                egui::Color32::from_gray(110)
+                            },
+                        ),
                     );
                 }
             }
 
             for node in nodes {
                 let center = egui::pos2(x_for_depth(node.depth), rect.top() + node.y);
-                painter.circle_filled(center, 8.0, egui::Color32::from_rgb(70, 145, 220));
+                painter.circle_filled(
+                    center,
+                    8.0,
+                    if node.is_max_score_path {
+                        egui::Color32::RED
+                    } else {
+                        egui::Color32::from_rgb(70, 145, 220)
+                    },
+                );
                 let label = match node.shift {
                     Some(shift) if node.children.is_empty() => match node.score {
                         Some(score) => format!("shift {shift} (score {score})"),
@@ -800,6 +837,7 @@ impl App for AppState {
                     result.result.shifts.len(),
                     self.search_tree.len().saturating_sub(1)
                 ));
+                ui.label(format!("経過時間: {}", result.config.elapsed));
                 show_search_tree(ui, &self.search_tree);
             } else if !self.is_searching {
                 ui.label("『検索』を押して可視化を開始してください。");
@@ -940,6 +978,12 @@ mod tests {
         assert_eq!(tree[1].children.len(), 2);
         assert_eq!(tree[1].parent, Some(0));
         assert_eq!(tree[2].score, Some(9));
+        assert!(tree[0].is_max_score_path);
+        assert!(tree[1].is_max_score_path);
+        assert!(tree[2].is_max_score_path);
+        assert!(!tree[3].is_max_score_path);
+        assert!(!tree[4].is_max_score_path);
+        assert!(!tree[5].is_max_score_path);
     }
 
     fn test_cli() -> Cli {
