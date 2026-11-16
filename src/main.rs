@@ -291,6 +291,9 @@ struct AppState {
     maximum_stored_depth: Result<Option<usize>, String>,
 }
 
+type AppOperation =
+    fn(Cli, Arc<SearchProgress>, Arc<AtomicBool>, Instant) -> Result<OutputFile<'static>, String>;
+
 struct TreeNode {
     shift: Option<usize>,
     parent: Option<usize>,
@@ -381,7 +384,7 @@ fn assign_tree_y(nodes: &mut [TreeNode], index: usize, next_leaf: &mut usize) ->
 }
 
 impl AppState {
-    fn start_search(&mut self) {
+    fn start_operation(&mut self, operation: AppOperation) {
         let start_time = Instant::now();
         self.start_time = start_time;
         self.search_error = None;
@@ -394,9 +397,17 @@ impl AppState {
         let progress = Arc::clone(&self.search_progress);
         let interrupted = Arc::clone(&self.interrupted);
         self.search_thread = Some(std::thread::spawn(move || {
-            run_search(cli, progress, interrupted, start_time)
+            operation(cli, progress, interrupted, start_time)
         }));
         self.is_searching = true;
+    }
+
+    fn start_search(&mut self) {
+        self.start_operation(run_search);
+    }
+
+    fn start_display(&mut self) {
+        self.start_operation(load_saved_results);
     }
 
     fn finish_search(&mut self) {
@@ -513,40 +524,6 @@ fn run_search(
         )
         .map_err(|error| error.to_string())?;
 
-    let completed_before = state
-        .is_search_complete()
-        .map_err(|error| error.to_string())?;
-    if resume_path.is_none() && completed_before {
-        let stored_records = state
-            .load_top_scored_paths(cli.depth, 100)
-            .map_err(|error| error.to_string())?;
-        let (path_scores, shifts): (Vec<_>, Vec<_>) = stored_records.into_iter().unzip();
-        let max_score = path_scores.first().copied().unwrap_or(0);
-        info!(
-            "Displaying {} saved depth {} records ordered by score descending and node ID ascending",
-            shifts.len(),
-            cli.depth
-        );
-        return Ok(OutputFile {
-            config: OutputConfig {
-                mode: match cli.mode {
-                    SearchMode::Sequential => "sequential",
-                    SearchMode::Parallel => "parallel",
-                },
-                depth: cli.depth,
-                cols: cli.cols,
-                elapsed: format!("{:?}", start_time.elapsed()),
-            },
-            result: OutputResult {
-                max_score,
-                results: shifts.len(),
-                shifts,
-                path_scores,
-                target_count: 0,
-                target_shifts: Vec::new(),
-            },
-        });
-    }
     if resume_path.is_none() {
         state
             .set_search_complete(false)
@@ -653,6 +630,54 @@ fn run_search(
         result,
     })
 }
+
+fn load_saved_results(
+    cli: Cli,
+    _progress: Arc<SearchProgress>,
+    _interrupted: Arc<AtomicBool>,
+    start_time: Instant,
+) -> Result<OutputFile<'static>, String> {
+    let all_primes = generate_primes(MAX_PRIME);
+    cli.validate(all_primes.len())?;
+
+    let shift_table = build_shift_table(&all_primes[..cli.depth], cli.cols);
+    let mut state = State::new(all_primes, cli.cols, shift_table);
+    state
+        .set_shift_path_store(&cli.output_dir.join("HLSearch.rocksdb"), cli.depth, false)
+        .map_err(|error| error.to_string())?;
+
+    let stored_records = state
+        .load_top_scored_paths(cli.depth, 100)
+        .map_err(|error| error.to_string())?;
+    let (path_scores, shifts): (Vec<_>, Vec<_>) = stored_records.into_iter().unzip();
+    let max_score = path_scores.first().copied().unwrap_or(0);
+    info!(
+        "Displaying {} saved depth {} records ordered by score descending and node ID ascending",
+        shifts.len(),
+        cli.depth
+    );
+
+    Ok(OutputFile {
+        config: OutputConfig {
+            mode: match cli.mode {
+                SearchMode::Sequential => "sequential",
+                SearchMode::Parallel => "parallel",
+            },
+            depth: cli.depth,
+            cols: cli.cols,
+            elapsed: format!("{:?}", start_time.elapsed()),
+        },
+        result: OutputResult {
+            max_score,
+            results: shifts.len(),
+            shifts,
+            path_scores,
+            target_count: 0,
+            target_shifts: Vec::new(),
+        },
+    })
+}
+
 fn show_search_tree(ui: &mut egui::Ui, nodes: &[TreeNode]) {
     let max_depth = nodes.iter().map(|node| node.depth).max().unwrap_or(0);
     let leaf_count = nodes
@@ -740,6 +765,7 @@ impl App for AppState {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let mut explore_requested = false;
         let mut search_requested = false;
         egui::Panel::top("top_view")
             .default_size(60.0)
@@ -753,6 +779,9 @@ impl App for AppState {
                         !self.is_searching,
                         egui::TextEdit::singleline(&mut self.depth_input).desired_width(80.0),
                     );
+                    explore_requested = ui
+                        .add_enabled(!self.is_searching, egui::Button::new("探索"))
+                        .clicked();
                     search_requested = ui
                         .add_enabled(!self.is_searching, egui::Button::new("検索"))
                         .clicked();
@@ -789,11 +818,15 @@ impl App for AppState {
                 }
             });
 
-        if search_requested {
+        if explore_requested || search_requested {
             match self.depth_input.parse::<usize>() {
                 Ok(depth) => {
                     self.cli.depth = depth;
-                    self.start_search();
+                    if explore_requested {
+                        self.start_search();
+                    } else {
+                        self.start_display();
+                    }
                 }
                 Err(_) => self.search_error = Some("深さは正の整数で入力してください".to_string()),
             }

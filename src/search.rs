@@ -226,13 +226,6 @@ impl State {
             .set_search_complete(complete)
     }
 
-    pub fn is_search_complete(&self) -> Result<bool, String> {
-        self.shift_path_store
-            .as_ref()
-            .ok_or_else(|| "RocksDB output is not configured".to_string())?
-            .is_search_complete()
-    }
-
     fn update_progress(
         progress_reporter: Option<&SearchProgress>,
         nodes: u64,

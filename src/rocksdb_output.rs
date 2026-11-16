@@ -426,6 +426,7 @@ impl ShiftPathStore {
             .map_err(err)
     }
 
+    #[allow(dead_code)]
     pub fn is_search_complete(&self) -> Result<bool, String> {
         let db = &self.dbs[0];
         let meta_cf = cf(db, CF_META)?;
