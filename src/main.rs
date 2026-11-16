@@ -81,6 +81,7 @@ struct OutputConfig<'a> {
 struct OutputResult {
     max_score: usize,
     results: usize,
+    total_count: u64,
     shifts: Vec<Vec<usize>>,
     path_scores: Vec<usize>,
     target_count: usize,
@@ -555,6 +556,7 @@ fn run_search(
                 OutputResult {
                     max_score: state.max_score,
                     results: state.results,
+                    total_count: 0,
                     path_scores: vec![state.max_score; state.shifts.len()],
                     shifts: state.shifts.clone(),
                     target_count: state.target_count,
@@ -576,6 +578,7 @@ fn run_search(
                 OutputResult {
                     max_score: result.max_score,
                     results: result.results,
+                    total_count: 0,
                     path_scores: vec![result.max_score; result.shifts.len()],
                     shifts: result.shifts,
                     target_count: result.target_count,
@@ -605,6 +608,9 @@ fn run_search(
         result.path_scores = path_scores;
         result.shifts = shifts;
     }
+    result.total_count = state
+        .count_depth_paths(cli.depth)
+        .map_err(|error| error.to_string())?;
 
     for filename in [CHECKPOINT_FILENAME, CHECKPOINT_BACKUP_FILENAME] {
         let checkpoint_path = cli.output_dir.join(filename);
@@ -649,6 +655,9 @@ fn load_saved_results(
     let stored_records = state
         .load_top_scored_paths(cli.depth, 100)
         .map_err(|error| error.to_string())?;
+    let total_count = state
+        .count_depth_paths(cli.depth)
+        .map_err(|error| error.to_string())?;
     let (path_scores, shifts): (Vec<_>, Vec<_>) = stored_records.into_iter().unzip();
     let max_score = path_scores.first().copied().unwrap_or(0);
     info!(
@@ -670,6 +679,7 @@ fn load_saved_results(
         result: OutputResult {
             max_score,
             results: shifts.len(),
+            total_count,
             shifts,
             path_scores,
             target_count: 0,
@@ -788,6 +798,13 @@ impl App for AppState {
                 });
                 if let Some(error) = &self.search_error {
                     ui.colored_label(egui::Color32::RED, error);
+                }
+                if let Some(result) = &self.search_results {
+                    ui.label(format!(
+                        "表示件数 / 総件数: {} / {}",
+                        result.result.shifts.len(),
+                        result.result.total_count
+                    ));
                 }
             });
 
@@ -1174,6 +1191,7 @@ mod tests {
         let json = serde_json::to_value(OutputResult {
             max_score: 447,
             results: 1,
+            total_count: 1,
             shifts: vec![vec![1, 1, 4]],
             path_scores: vec![447],
             target_count: 0,

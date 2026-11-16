@@ -219,6 +219,13 @@ impl State {
         }
     }
 
+    pub fn count_depth_paths(&self, depth: usize) -> Result<u64, String> {
+        self.shift_path_store
+            .as_ref()
+            .ok_or_else(|| "RocksDB output is not configured".to_string())?
+            .count_depth_paths(depth)
+    }
+
     pub fn set_search_complete(&self, complete: bool) -> Result<(), String> {
         self.shift_path_store
             .as_ref()
