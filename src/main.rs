@@ -288,6 +288,7 @@ struct AppState {
     interrupted: Arc<AtomicBool>,
     search_thread: Option<JoinHandle<Result<OutputFile<'static>, String>>>,
     is_searching: bool,
+    maximum_stored_depth: Result<Option<usize>, String>,
 }
 
 struct TreeNode {
@@ -800,6 +801,14 @@ impl App for AppState {
 
         egui::CentralPanel::default().show(ui, |ui| {
             ui.heading("探索結果");
+            match &self.maximum_stored_depth {
+                Ok(Some(depth)) => ui.label(format!("保存済み RocksDB の最大深さ: {depth}")),
+                Ok(None) => ui.label("保存済み RocksDB: なし"),
+                Err(error) => ui.colored_label(
+                    egui::Color32::RED,
+                    format!("RocksDB の保存済み深さを取得できません: {error}"),
+                ),
+            };
             if self.is_searching {
                 let progress = self.search_progress.snapshot();
                 ui.separator();
@@ -896,6 +905,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         options,
         Box::new(move |cc| {
             cc.egui_ctx.set_fonts(japanese_fonts);
+            let maximum_stored_depth =
+                rocksdb_output::maximum_stored_depth(&cli.output_dir.join("HLSearch.rocksdb"));
             let app = AppState {
                 cli: cli.clone(),
                 start_time: Instant::now(),
@@ -908,6 +919,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 interrupted: Arc::clone(&interrupted),
                 search_thread: None,
                 is_searching: false,
+                maximum_stored_depth,
             };
             Ok(Box::new(app) as Box<dyn eframe::App>)
         }),

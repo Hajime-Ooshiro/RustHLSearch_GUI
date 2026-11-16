@@ -37,6 +37,40 @@ const CF_META: &str = "meta";
 
 type PendingAppends = Vec<(usize, Vec<usize>)>;
 
+pub fn maximum_stored_depth(path: &Path) -> Result<Option<usize>, String> {
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let shard_zero = shard_path(path, 0);
+    if !shard_zero.exists() {
+        return Err(format!(
+            "RocksDB シャードが見つかりません: {}",
+            shard_zero.display()
+        ));
+    }
+
+    let options = Options::default();
+    let db = DB::open_cf_for_read_only(&options, shard_zero, [CF_META], false).map_err(err)?;
+    let meta_cf = cf(&db, CF_META)?;
+    let mut maximum = None;
+    for item in db.iterator_cf(meta_cf, IteratorMode::Start) {
+        let (key, _) = item.map_err(err)?;
+        let Ok(key) = std::str::from_utf8(&key) else {
+            continue;
+        };
+        let Some(depth) = key
+            .strip_prefix("config_hash:")
+            .and_then(|depth| depth.parse::<usize>().ok())
+        else {
+            continue;
+        };
+        maximum = Some(maximum.map_or(depth, |current: usize| current.max(depth)));
+    }
+
+    Ok(maximum)
+}
+
 /// `nodes` CF に JSON で保存されるノード情報
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeRecord {
@@ -701,7 +735,7 @@ fn store_config_hash(db: &DB, depth: usize, config_hash: u64) -> Result<(), Stri
 
 #[cfg(test)]
 mod tests {
-    use super::{node_shard, NodeRecord, ShiftPathStore, SHARD_COUNT};
+    use super::{maximum_stored_depth, node_shard, NodeRecord, ShiftPathStore, SHARD_COUNT};
 
     fn database_path() -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
@@ -712,6 +746,18 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ))
+    }
+
+    #[test]
+    fn maximum_stored_depth_reads_configured_depths() {
+        let path = database_path();
+        assert_eq!(maximum_stored_depth(&path).unwrap(), None);
+
+        drop(ShiftPathStore::create(&path, 2, true, 12345).unwrap());
+        drop(ShiftPathStore::create(&path, 4, true, 67890).unwrap());
+
+        assert_eq!(maximum_stored_depth(&path).unwrap(), Some(4));
+        std::fs::remove_dir_all(path).unwrap();
     }
 
     #[test]
