@@ -23,6 +23,15 @@ const CHECKPOINT_FILENAME: &str = "checkpoint.json";
 const CHECKPOINT_BACKUP_FILENAME: &str = "checkpoint.bak";
 const LOG_FILENAME: &str = "hlsearch.log";
 const MAX_LOG_ENTRIES: usize = 500;
+const MAX_DISPLAY_RESULTS: usize = 30;
+
+fn format_total_count(total_count: u64) -> String {
+    if total_count > 1_000 {
+        format!("{:.2e}", total_count as f64)
+    } else {
+        total_count.to_string()
+    }
+}
 
 struct UiLogger {
     entries: Arc<Mutex<VecDeque<String>>>,
@@ -599,7 +608,7 @@ fn run_search(
         .set_search_complete(true)
         .map_err(|error| error.to_string())?;
     let stored_records = state
-        .load_top_scored_paths(cli.depth, 100)
+        .load_top_scored_paths(cli.depth, MAX_DISPLAY_RESULTS)
         .map_err(|error| error.to_string())?;
     if !stored_records.is_empty() {
         let (path_scores, shifts): (Vec<_>, Vec<_>) = stored_records.into_iter().unzip();
@@ -653,7 +662,7 @@ fn load_saved_results(
         .map_err(|error| error.to_string())?;
 
     let stored_records = state
-        .load_top_scored_paths(cli.depth, 100)
+        .load_top_scored_paths(cli.depth, MAX_DISPLAY_RESULTS)
         .map_err(|error| error.to_string())?;
     let total_count = state
         .count_depth_paths(cli.depth)
@@ -803,7 +812,7 @@ impl App for AppState {
                     ui.label(format!(
                         "表示件数 / 総件数: {} / {}",
                         result.result.shifts.len(),
-                        result.result.total_count
+                        format_total_count(result.result.total_count)
                     ));
                 }
             });
@@ -1200,5 +1209,12 @@ mod tests {
         .unwrap();
 
         assert_eq!(json["shifts"], serde_json::json!([[1, 1, 4]]));
+    }
+
+    #[test]
+    fn format_total_count_uses_scientific_notation_above_1000() {
+        assert_eq!(format_total_count(1_000), "1000");
+        assert_eq!(format_total_count(1_001), "1.00e3");
+        assert_eq!(format_total_count(12_345), "1.23e4");
     }
 }
