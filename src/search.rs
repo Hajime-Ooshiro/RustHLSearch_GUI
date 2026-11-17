@@ -286,14 +286,51 @@ impl State {
             .shift_path_store
             .as_ref()
             .ok_or_else(|| "RocksDB output is not configured".to_string())?;
-        let candidates = store
-            .load_full_depth_paths(depth)?
-            .into_iter()
-            .filter_map(|key| {
+        if store.count_depth_paths(depth)? <= BEAM_WIDTH as u64 {
+            let mut candidates: Vec<_> = store
+                .load_full_depth_paths(depth)?
+                .into_iter()
+                .filter_map(|key| {
+                    let score = self.rebuild_masks(depth, &key)[key.len()].count_ones();
+                    (score >= self.target).then_some(BeamCandidate { key, score })
+                })
+                .collect();
+            candidates.sort_unstable_by(|left, right| {
+                right
+                    .score
+                    .cmp(&left.score)
+                    .then_with(|| right.key.cmp(&left.key))
+            });
+            return Ok(candidates);
+        }
+
+        let mut candidates = Vec::with_capacity(BEAM_WIDTH);
+        let mut after_node_id = None;
+
+        loop {
+            let batch =
+                store.load_full_depth_paths_batch(depth, after_node_id, PREVIOUS_DEPTH_BATCH_SIZE)?;
+            let Some((last_node_id, _)) = batch.last() else {
+                break;
+            };
+            after_node_id = Some(*last_node_id);
+
+            for (_, key) in batch.into_iter().rev() {
                 let score = self.rebuild_masks(depth, &key)[key.len()].count_ones();
-                (score >= self.target).then_some(BeamCandidate { key, score })
-            })
-            .collect();
+                if score < self.target {
+                    continue;
+                }
+
+                candidates.push(BeamCandidate { key, score });
+                if candidates.len() > BEAM_WIDTH {
+                    Self::limit_beam_width(&mut candidates);
+                }
+            }
+        }
+
+        if candidates.len() > BEAM_WIDTH {
+            Self::limit_beam_width(&mut candidates);
+        }
         Ok(candidates)
     }
 
@@ -384,6 +421,7 @@ impl State {
         } else if score == self.max_score {
             self.results += 1;
             self.shifts.push(key.to_vec());
+            self.shifts.sort_unstable_by(|left, right| right.cmp(left));
             debug!("best level={} key={:?} score={}", key.len() - 1, key, score);
         }
         Ok(())
