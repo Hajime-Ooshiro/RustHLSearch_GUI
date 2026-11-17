@@ -11,8 +11,7 @@ use std::sync::Arc;
 const SHIFT_PATH_BATCH_SIZE: usize = 256;
 const PREVIOUS_DEPTH_BATCH_SIZE: usize = 210;
 const PROGRESS_UPDATE_NODE_INTERVAL: u64 = 256;
-const BEAM_WIDTH: usize = 210;
-const BEAM_POLICY_VERSION: u64 = 3;
+const BEAM_POLICY_VERSION: u64 = 4;
 
 /// 基底行の生成と補集合シフトテーブルの作成
 pub fn build_shift_table(primes: &[usize], cols: usize) -> Vec<Vec<BitMask>> {
@@ -286,51 +285,20 @@ impl State {
             .shift_path_store
             .as_ref()
             .ok_or_else(|| "RocksDB output is not configured".to_string())?;
-        if store.count_depth_paths(depth)? <= BEAM_WIDTH as u64 {
-            let mut candidates: Vec<_> = store
-                .load_full_depth_paths(depth)?
-                .into_iter()
-                .filter_map(|key| {
-                    let score = self.rebuild_masks(depth, &key)[key.len()].count_ones();
-                    (score >= self.target).then_some(BeamCandidate { key, score })
-                })
-                .collect();
-            candidates.sort_unstable_by(|left, right| {
-                right
-                    .score
-                    .cmp(&left.score)
-                    .then_with(|| right.key.cmp(&left.key))
-            });
-            return Ok(candidates);
-        }
-
-        let mut candidates = Vec::with_capacity(BEAM_WIDTH);
-        let mut after_node_id = None;
-
-        loop {
-            let batch =
-                store.load_full_depth_paths_batch(depth, after_node_id, PREVIOUS_DEPTH_BATCH_SIZE)?;
-            let Some((last_node_id, _)) = batch.last() else {
-                break;
-            };
-            after_node_id = Some(*last_node_id);
-
-            for (_, key) in batch.into_iter().rev() {
+        let mut candidates: Vec<_> = store
+            .load_full_depth_paths(depth)?
+            .into_iter()
+            .filter_map(|key| {
                 let score = self.rebuild_masks(depth, &key)[key.len()].count_ones();
-                if score < self.target {
-                    continue;
-                }
-
-                candidates.push(BeamCandidate { key, score });
-                if candidates.len() > BEAM_WIDTH {
-                    Self::limit_beam_width(&mut candidates);
-                }
-            }
-        }
-
-        if candidates.len() > BEAM_WIDTH {
-            Self::limit_beam_width(&mut candidates);
-        }
+                (score >= self.target).then_some(BeamCandidate { key, score })
+            })
+            .collect();
+        candidates.sort_unstable_by(|left, right| {
+            right
+                .score
+                .cmp(&left.score)
+                .then_with(|| right.key.cmp(&left.key))
+        });
         Ok(candidates)
     }
 
@@ -347,16 +315,6 @@ impl State {
             )?;
         }
         store.flush()
-    }
-
-    fn limit_beam_width(candidates: &mut Vec<BeamCandidate>) {
-        candidates.sort_unstable_by(|left, right| {
-            right
-                .score
-                .cmp(&left.score)
-                .then_with(|| left.key.cmp(&right.key))
-        });
-        candidates.truncate(BEAM_WIDTH);
     }
 
     fn evaluate_frontier_parallel(
@@ -514,7 +472,7 @@ impl State {
                     (score >= self.target).then_some(BeamCandidate { key, score })
                 })
                 .collect();
-            let mut candidates = match mode {
+            let candidates = match mode {
                 SearchMode::Sequential => {
                     let mut candidates = Vec::new();
                     for candidate in &frontier {
@@ -560,8 +518,6 @@ impl State {
                     candidates
                 }
             };
-            Self::limit_beam_width(&mut candidates);
-
             for candidate in candidates {
                 self.aggregate_target_result(depth, candidate.score, &candidate.key)
                     .map_err(std::io::Error::other)?;
@@ -795,7 +751,6 @@ impl State {
                 level += 1;
                 self.submit_shift_path_batch(&mut pending_appends)
                     .map_err(std::io::Error::other)?;
-                Self::limit_beam_width(&mut candidates);
                 if let Some(store) = &self.shift_path_store {
                     store
                         .replace_depth_paths(
@@ -1210,7 +1165,7 @@ impl State {
                 return Ok((results, true));
             }
 
-            let Some((nodes, mut candidates)) =
+            let Some((nodes, candidates)) =
                 self.evaluate_frontier_parallel(&frontier, level, interrupted)
             else {
                 self.write_beam_checkpoint(
@@ -1226,7 +1181,6 @@ impl State {
                 return Ok((SharedResults::default(), false));
             };
             self.node_count += nodes;
-            Self::limit_beam_width(&mut candidates);
             self.persist_candidates(&candidates)
                 .map_err(std::io::Error::other)?;
 
@@ -1366,7 +1320,7 @@ mod tests {
     }
 
     #[test]
-    fn beam_search_limits_candidates_at_each_level() {
+    fn beam_search_keeps_all_unpruned_candidates_at_each_level() {
         let primes = vec![23, 23, 2];
         let cols = 529;
         let table = build_shift_table(&primes, cols);
@@ -1378,7 +1332,7 @@ mod tests {
         parallel.target = 0;
         let parallel_result = parallel.search_parallel(3, None, None).unwrap();
 
-        let expected_node_count = (23 + 23 * 23 + 210 * 2) as u64;
+        let expected_node_count = (23 + 23 * 23 + 23 * 23 * 2) as u64;
         assert_eq!(sequential.node_count, expected_node_count);
         assert_eq!(parallel.node_count, expected_node_count);
         assert_eq!(parallel_result.max_score, sequential.max_score);
