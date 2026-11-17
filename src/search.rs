@@ -123,6 +123,9 @@ pub struct SearchProgress {
     depth: AtomicUsize,
     prefix_done: AtomicU64,
     prefix_total: AtomicU64,
+    db_insert_done: AtomicU64,
+    db_insert_total: AtomicU64,
+    db_insert_active: AtomicBool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -133,6 +136,9 @@ pub struct SearchProgressSnapshot {
     pub depth: usize,
     pub prefix_done: u64,
     pub prefix_total: u64,
+    pub db_insert_done: u64,
+    pub db_insert_total: u64,
+    pub db_insert_active: bool,
 }
 
 impl SearchProgress {
@@ -144,6 +150,9 @@ impl SearchProgress {
             depth: self.depth.load(Ordering::Relaxed),
             prefix_done: self.prefix_done.load(Ordering::Relaxed),
             prefix_total: self.prefix_total.load(Ordering::Relaxed),
+            db_insert_done: self.db_insert_done.load(Ordering::Relaxed),
+            db_insert_total: self.db_insert_total.load(Ordering::Relaxed),
+            db_insert_active: self.db_insert_active.load(Ordering::Relaxed),
         }
     }
 
@@ -165,6 +174,22 @@ impl SearchProgress {
 
     fn add_prefix_done(&self, prefixes: u64) {
         self.prefix_done.fetch_add(prefixes, Ordering::Relaxed);
+    }
+
+    fn begin_db_insert(&self, total: u64) {
+        self.db_insert_done.store(0, Ordering::Relaxed);
+        self.db_insert_total.store(total, Ordering::Relaxed);
+        self.db_insert_active.store(true, Ordering::Relaxed);
+    }
+
+    fn complete_db_insert(&self, done: u64) {
+        self.db_insert_done.store(done, Ordering::Relaxed);
+        self.db_insert_active.store(false, Ordering::Relaxed);
+    }
+
+    fn cancel_db_insert(&self) {
+        self.db_insert_done.store(0, Ordering::Relaxed);
+        self.db_insert_active.store(false, Ordering::Relaxed);
     }
 }
 
@@ -263,9 +288,47 @@ impl State {
         pending: &mut Vec<(usize, Vec<usize>)>,
     ) -> Result<(), String> {
         if let Some(store) = &self.shift_path_store {
-            store.append_batch(std::mem::take(pending))?;
+            let appends = std::mem::take(pending);
+            if appends.is_empty() {
+                return Ok(());
+            }
+            let insert_count = appends.len() as u64;
+            if let Some(reporter) = &self.progress_reporter {
+                reporter.begin_db_insert(insert_count);
+            }
+            let result = store.append_batch(appends).and_then(|()| store.flush());
+            if let Some(reporter) = &self.progress_reporter {
+                if result.is_ok() {
+                    reporter.complete_db_insert(insert_count);
+                } else {
+                    reporter.cancel_db_insert();
+                }
+            }
+            result?;
         }
         Ok(())
+    }
+
+    fn replace_shift_path_depth(
+        &self,
+        depth: usize,
+        paths: &[(usize, Vec<usize>)],
+    ) -> Result<(), String> {
+        let Some(store) = &self.shift_path_store else {
+            return Ok(());
+        };
+        if let Some(reporter) = &self.progress_reporter {
+            reporter.begin_db_insert(paths.len() as u64);
+        }
+        let result = store.replace_depth_paths(depth, paths);
+        if let Some(reporter) = &self.progress_reporter {
+            if result.is_ok() {
+                reporter.complete_db_insert(paths.len() as u64);
+            } else {
+                reporter.cancel_db_insert();
+            }
+        }
+        result
     }
 
     fn has_previous_depth_paths(&self, depth: usize) -> Result<bool, String> {
@@ -307,12 +370,11 @@ impl State {
             return Ok(());
         };
         for batch in candidates.chunks(SHIFT_PATH_BATCH_SIZE) {
-            store.append_batch(
-                batch
-                    .iter()
-                    .map(|candidate| (candidate.score, candidate.key.clone()))
-                    .collect(),
-            )?;
+            let mut pending = batch
+                .iter()
+                .map(|candidate| (candidate.score, candidate.key.clone()))
+                .collect();
+            self.submit_shift_path_batch(&mut pending)?;
         }
         store.flush()
     }
@@ -635,18 +697,15 @@ impl State {
                 )?;
             let next_frontier = if checkpoint.beam_next_frontier_checkpointed {
                 if checkpoint.beam_level < depth {
-                    if let Some(store) = &self.shift_path_store {
-                        store
-                            .replace_depth_paths(
-                                checkpoint.beam_level + 1,
-                                &checkpoint
-                                    .beam_next_frontier
-                                    .iter()
-                                    .map(|candidate| (candidate.score, candidate.key.clone()))
-                                    .collect::<Vec<_>>(),
-                            )
-                            .map_err(std::io::Error::other)?;
-                    }
+                    self.replace_shift_path_depth(
+                        checkpoint.beam_level + 1,
+                        &checkpoint
+                            .beam_next_frontier
+                            .iter()
+                            .map(|candidate| (candidate.score, candidate.key.clone()))
+                            .collect::<Vec<_>>(),
+                    )
+                    .map_err(std::io::Error::other)?;
                 }
                 checkpoint.beam_next_frontier
             } else if self.shift_path_store.is_some() && checkpoint.beam_level < depth {
@@ -751,17 +810,14 @@ impl State {
                 level += 1;
                 self.submit_shift_path_batch(&mut pending_appends)
                     .map_err(std::io::Error::other)?;
-                if let Some(store) = &self.shift_path_store {
-                    store
-                        .replace_depth_paths(
-                            level,
-                            &candidates
-                                .iter()
-                                .map(|candidate| (candidate.score, candidate.key.clone()))
-                                .collect::<Vec<_>>(),
-                        )
-                        .map_err(std::io::Error::other)?;
-                }
+                self.replace_shift_path_depth(
+                    level,
+                    &candidates
+                        .iter()
+                        .map(|candidate| (candidate.score, candidate.key.clone()))
+                        .collect::<Vec<_>>(),
+                )
+                .map_err(std::io::Error::other)?;
                 frontier = if self.shift_path_store.is_some() {
                     candidates.clear();
                     self.load_candidates_from_store(level)
@@ -1082,17 +1138,14 @@ impl State {
                 "Checkpoint predates beam search and cannot be resumed; use a different --output-dir",
             )?;
             if checkpoint.beam_next_frontier_checkpointed && checkpoint.beam_level > 0 {
-                if let Some(store) = &self.shift_path_store {
-                    store
-                        .replace_depth_paths(
-                            checkpoint.beam_level,
-                            &frontier
-                                .iter()
-                                .map(|candidate| (candidate.score, candidate.key.clone()))
-                                .collect::<Vec<_>>(),
-                        )
-                        .map_err(std::io::Error::other)?;
-                }
+                self.replace_shift_path_depth(
+                    checkpoint.beam_level,
+                    &frontier
+                        .iter()
+                        .map(|candidate| (candidate.score, candidate.key.clone()))
+                        .collect::<Vec<_>>(),
+                )
+                .map_err(std::io::Error::other)?;
             }
             self.node_count = checkpoint.node_count;
             (frontier, checkpoint.beam_level)
@@ -1257,8 +1310,28 @@ mod tests {
                 depth: 4,
                 prefix_done: 0,
                 prefix_total: 0,
+                db_insert_done: 0,
+                db_insert_total: 0,
+                db_insert_active: false,
             }
         );
+    }
+
+    #[test]
+    fn progress_reporter_tracks_bulk_db_insert() {
+        let progress = super::SearchProgress::default();
+        progress.begin_db_insert(256);
+
+        let snapshot = progress.snapshot();
+        assert!(snapshot.db_insert_active);
+        assert_eq!(snapshot.db_insert_done, 0);
+        assert_eq!(snapshot.db_insert_total, 256);
+
+        progress.complete_db_insert(256);
+        let snapshot = progress.snapshot();
+        assert!(!snapshot.db_insert_active);
+        assert_eq!(snapshot.db_insert_done, 256);
+        assert_eq!(snapshot.db_insert_total, 256);
     }
 
     #[test]
