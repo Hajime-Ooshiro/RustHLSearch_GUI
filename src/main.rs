@@ -895,10 +895,10 @@ impl App for AppState {
                         (progress.db_insert_done as f32 / progress.db_insert_total as f32)
                             .clamp(0.0, 1.0)
                     };
-                    ui.add(egui::ProgressBar::new(insert_fraction).text(format!(
-                        "RocksDB 一括挿入: {}/{}",
-                        progress.db_insert_done, progress.db_insert_total
-                    )));
+                    // ui.add(egui::ProgressBar::new(insert_fraction).text(format!(
+                    //     "RocksDB 一括挿入: {}/{}",
+                    //     progress.db_insert_done, progress.db_insert_total
+                    // )));
                 }
                 ui.label(format!("経過時間: {:?}", self.start_time.elapsed()));
             }
