@@ -21,7 +21,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 
 const MAX_DEPTH: usize = 249;
-const APPEND_BATCH_SIZE: usize = 4096;
+const APPEND_BATCH_SIZE: usize = 30030;
 const SHARD_COUNT: usize = 210;
 const SHARED_CACHE_SIZE: usize = 32 * 1024 * 1024;
 const SHARED_WRITE_BUFFER_SIZE: usize = 128 * 1024 * 1024;
