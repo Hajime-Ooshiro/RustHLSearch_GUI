@@ -152,143 +152,10 @@ impl Cli {
     }
 }
 
-// fn main() -> Result<(), Box<dyn std::error::Error>> {
-//     SimpleLogger::new().with_level(LevelFilter::Info).init()?;
-//     let cli = Cli::parse();
-//     let interrupted = Arc::new(AtomicBool::new(false));
-//     {
-//         let interrupted = Arc::clone(&interrupted);
-//         ctrlc::set_handler(move || {
-//             interrupted.store(true, Ordering::SeqCst);
-//         })?;
-//     }
-//     let all_primes = generate_primes(MAX_PRIME);
-
-//     if let Err(message) = cli.validate(all_primes.len()) {
-//         eprintln!("エラー: {}", message);
-//         std::process::exit(1);
-//     }
-
-//     let primes = all_primes;
-
-//     info!("HLSearch (Rust) 開始");
-//     info!(
-//         "設定: mode={:?} depth={} primes={}",
-//         cli.mode,
-//         cli.depth,
-//         primes.len()
-//     );
-
-//     let start_time = Instant::now();
-//     let shift_table = build_shift_table(&primes[..cli.depth], cli.cols);
-//     let mut state = State::new(primes, cli.cols, shift_table);
-//     state.checkpoint_interval = cli.checkpoint_interval;
-//     let progress_bar = ProgressBar::new_spinner();
-//     progress_bar.set_style(
-//         ProgressStyle::with_template("{spinner:.cyan} {msg}")?
-//             .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
-//     );
-//     progress_bar.enable_steady_tick(std::time::Duration::from_millis(100));
-//     state.set_progress_bar(progress_bar);
-
-//     // 探索中にチェックポイントを書き出すため、他の出力より先に output_dir を用意する
-//     std::fs::create_dir_all(&cli.output_dir)?;
-//     let shift_path = cli.output_dir.join("HLSearch.rocksdb");
-//     let checkpoint_path = cli.output_dir.join(CHECKPOINT_FILENAME);
-//     let backup_path = cli.output_dir.join(CHECKPOINT_BACKUP_FILENAME);
-//     let resume_path = if checkpoint_path.exists() {
-//         Some(checkpoint_path.as_path())
-//     } else {
-//         backup_path.exists().then_some(backup_path.as_path())
-//     };
-//     state.set_shift_path_store(&shift_path, cli.depth, resume_path.is_none())?;
-
-//     let completed = match cli.mode {
-//         SearchMode::Sequential => state.search_with_checkpoint_interruptible(
-//             cli.depth,
-//             Some(&checkpoint_path),
-//             resume_path,
-//             &interrupted,
-//         )?,
-//         SearchMode::Parallel => {
-//             let (result, completed) = state.search_parallel_interruptible(
-//                 cli.depth,
-//                 Some(&checkpoint_path),
-//                 resume_path,
-//                 &interrupted,
-//             )?;
-//             state.max_score = result.max_score;
-//             state.results = result.results;
-//             state.shifts = result.shifts;
-//             state.target_count = result.target_count;
-//             state.target_shifts = result.target_shifts;
-//             state.node_count = result.node_count;
-//             completed
-//         }
-//     };
-
-//     if !completed {
-//         state.finish_progress(false);
-//         info!(
-//             "中断要求を受信したためチェックポイントを保存しました: {}",
-//             checkpoint_path.display()
-//         );
-//         return Ok(());
-//     }
-
-//     if checkpoint_path.exists() {
-//         std::fs::remove_file(&checkpoint_path)?;
-//         if backup_path.exists() {
-//             std::fs::remove_file(&backup_path)?;
-//         }
-//         info!(
-//             "探索完了のためチェックポイントを削除: {}",
-//             checkpoint_path.display()
-//         );
-//     }
-
-//     state.finish_progress(true);
-//     let elapsed = start_time.elapsed();
-//     info!("探索時間: {:?}", elapsed);
-//     info!("最大値: {}", state.max_score);
-//     info!("該当件数: {}", state.results);
-//     info!("ターゲット一致件数: {}", state.target_count);
-
-//     info!("シフトパスRocksDB出力ディレクトリ: {}", shift_path.display());
-
-//     let result_path = with_timestamp(&cli.output_dir.join("result.txt"), cli.depth);
-//     let result_file = File::create(&result_path)?;
-//     let mut result_writer = BufWriter::new(result_file);
-//     info!("探索結果出力ファイル: {}", result_path.display());
-
-//     let output = OutputFile {
-//         config: OutputConfig {
-//             mode: match cli.mode {
-//                 SearchMode::Sequential => "sequential",
-//                 SearchMode::Parallel => "parallel",
-//             },
-//             depth: cli.depth,
-//             cols: cli.cols,
-//             elapsed: format!("{elapsed:?}"),
-//         },
-//         result: OutputResult {
-//             max_score: state.max_score,
-//             results: state.results,
-//             shifts: state.shifts,
-//             target_count: state.target_count,
-//             target_shifts: state.target_shifts,
-//         },
-//     };
-//     serde_json::to_writer_pretty(&mut result_writer, &output)?;
-//     writeln!(result_writer)?;
-
-//     info!("HLSearch 終了");
-//     Ok(())
-// }
-
 struct AppState {
     cli: Cli,
-    start_time: Instant,
+    operation_started_at: Option<Instant>,
+    elapsed: Option<Duration>,
     search_results: Option<OutputFile<'static>>, // Use lifetime annotation or Box if necessary in a real scenario
     search_tree: Vec<TreeNode>,
     depth_input: usize,
@@ -396,7 +263,8 @@ fn assign_tree_y(nodes: &mut [TreeNode], index: usize, next_leaf: &mut usize) ->
 impl AppState {
     fn start_operation(&mut self, operation: AppOperation) {
         let start_time = Instant::now();
-        self.start_time = start_time;
+        self.operation_started_at = Some(start_time);
+        self.elapsed = None;
         self.search_error = None;
         self.search_results = None;
         self.search_tree.clear();
@@ -424,6 +292,8 @@ impl AppState {
         let Some(search_thread) = self.search_thread.take() else {
             return;
         };
+        self.elapsed = self.operation_started_at.map(|started| started.elapsed());
+        self.operation_started_at = None;
         self.is_searching = false;
         match search_thread.join() {
             Ok(Ok(result)) => {
@@ -886,20 +756,9 @@ impl App for AppState {
                     ));
                 });
             }
-            //     if progress.db_insert_active {
-            //         let insert_fraction = if progress.db_insert_total == 0 {
-            //             0.0
-            //         } else {
-            //             (progress.db_insert_done as f32 / progress.db_insert_total as f32)
-            //                 .clamp(0.0, 1.0)
-            //         };
-            //         ui.add(egui::ProgressBar::new(insert_fraction).text(format!(
-            //             "RocksDB 一括挿入: {}/{}",
-            //             progress.db_insert_done, progress.db_insert_total
-            //         )));
-            //     }
-            ui.label(format!("経過時間: {:?}", self.start_time.elapsed()));
-            // }
+            if let Some(started_at) = self.operation_started_at {
+                ui.label(format!("経過時間: {:?}", started_at.elapsed()));
+            }
 
             if let Some(result) = &self.search_results {
                 ui.separator();
@@ -918,6 +777,9 @@ impl App for AppState {
                 ui.label(format!("経過時間: {}", result.config.elapsed));
                 show_search_tree(ui, &self.search_tree);
             } else if !self.is_searching {
+                if let Some(elapsed) = self.elapsed {
+                    ui.label(format!("経過時間: {:?}", elapsed));
+                }
                 ui.label("『検索』を押して可視化を開始してください。");
             } else {
                 ui.label("検索実行中...");
@@ -978,7 +840,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 rocksdb_output::maximum_stored_depth(&cli.output_dir.join("HLSearch.rocksdb"));
             let app = AppState {
                 cli: cli.clone(),
-                start_time: Instant::now(),
+                operation_started_at: None,
+                elapsed: None,
                 search_results: None,
                 search_tree: Vec::new(),
                 depth_input: cli.depth,
