@@ -14,7 +14,7 @@ use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -164,9 +164,14 @@ struct AppState {
     search_progress: Arc<SearchProgress>,
     interrupted: Arc<AtomicBool>,
     exit_requested: Arc<AtomicBool>,
+    force_exit: Arc<AtomicBool>,
     search_thread: Option<JoinHandle<Result<OutputFile<'static>, String>>>,
     is_searching: bool,
     maximum_stored_depth: Result<Option<usize>, String>,
+}
+
+fn is_checkpoint_interrupt_error(error: &str) -> bool {
+    error.starts_with("検索が中断されました。チェックポイントを保存しました:")
 }
 
 type AppOperation =
@@ -262,6 +267,10 @@ fn assign_tree_y(nodes: &mut [TreeNode], index: usize, next_leaf: &mut usize) ->
 }
 
 impl AppState {
+    fn request_interrupt(&mut self) {
+        self.interrupted.store(true, Ordering::SeqCst);
+    }
+
     fn start_operation(&mut self, operation: AppOperation) {
         let start_time = Instant::now();
         self.operation_started_at = Some(start_time);
@@ -641,6 +650,11 @@ fn show_search_tree(ui: &mut egui::Ui, nodes: &[TreeNode]) {
 
 impl App for AppState {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if self.force_exit.load(Ordering::SeqCst) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            return;
+        }
+
         if self.exit_requested.load(Ordering::SeqCst) {
             if self
                 .search_thread
@@ -648,10 +662,22 @@ impl App for AppState {
                 .map(JoinHandle::is_finished)
                 .unwrap_or(true)
             {
-                if self.search_thread.is_some() {
+                let no_worker_was_running = self.search_thread.is_none();
+                if !no_worker_was_running {
                     self.finish_search();
                 }
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                let can_close = no_worker_was_running
+                    || self.search_results.is_some()
+                    || self
+                        .search_error
+                        .as_deref()
+                        .is_some_and(is_checkpoint_interrupt_error);
+                if can_close {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                } else {
+                    self.exit_requested.store(false, Ordering::SeqCst);
+                    ctx.request_repaint();
+                }
                 return;
             }
             ctx.request_repaint_after(Duration::from_millis(100));
@@ -674,6 +700,7 @@ impl App for AppState {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let mut explore_requested = false;
         let mut search_requested = false;
+        let mut interrupt_requested = false;
         egui::Panel::top("top_view")
             .default_size(60.0)
             .resizable(true)
@@ -693,6 +720,9 @@ impl App for AppState {
                         .clicked();
                     search_requested = ui
                         .add_enabled(!self.is_searching, egui::Button::new("検索"))
+                        .clicked();
+                    interrupt_requested = ui
+                        .add_enabled(self.is_searching, egui::Button::new("中断"))
                         .clicked();
                 });
                 if let Some(error) = &self.search_error {
@@ -741,6 +771,9 @@ impl App for AppState {
             } else {
                 self.start_display();
             }
+        }
+        if interrupt_requested {
+            self.request_interrupt();
         }
 
         egui::CentralPanel::default().show(ui, |ui| {
@@ -822,12 +855,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     log::set_max_level(LevelFilter::Info);
     let interrupted = Arc::new(AtomicBool::new(false));
     let exit_requested = Arc::new(AtomicBool::new(false));
+    let force_exit = Arc::new(AtomicBool::new(false));
+    let ctrl_c_count = Arc::new(AtomicUsize::new(0));
     {
         let interrupted = Arc::clone(&interrupted);
         let exit_requested = Arc::clone(&exit_requested);
+        let force_exit = Arc::clone(&force_exit);
+        let ctrl_c_count = Arc::clone(&ctrl_c_count);
         ctrlc::set_handler(move || {
+            let count = ctrl_c_count.fetch_add(1, Ordering::SeqCst) + 1;
             interrupted.store(true, Ordering::SeqCst);
             exit_requested.store(true, Ordering::SeqCst);
+            if count >= 2 {
+                force_exit.store(true, Ordering::SeqCst);
+            }
         })?;
     }
 
@@ -871,6 +912,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 search_progress: Arc::new(SearchProgress::default()),
                 interrupted: Arc::clone(&interrupted),
                 exit_requested: Arc::clone(&exit_requested),
+                force_exit: Arc::clone(&force_exit),
                 search_thread: None,
                 is_searching: false,
                 maximum_stored_depth,
@@ -890,6 +932,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn identifies_checkpoint_interrupt_errors() {
+        assert!(is_checkpoint_interrupt_error(
+            "検索が中断されました。チェックポイントを保存しました: checkpoint.json"
+        ));
+        assert!(!is_checkpoint_interrupt_error(
+            "RocksDB の保存に失敗しました"
+        ));
+    }
 
     #[test]
     fn japanese_font_supports_ui_glyphs_when_available() {
