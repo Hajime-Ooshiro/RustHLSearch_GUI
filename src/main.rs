@@ -291,7 +291,7 @@ struct AppState {
     start_time: Instant,
     search_results: Option<OutputFile<'static>>, // Use lifetime annotation or Box if necessary in a real scenario
     search_tree: Vec<TreeNode>,
-    depth_input: String,
+    depth_input: usize,
     search_error: Option<String>,
     log_entries: Arc<Mutex<VecDeque<String>>>,
     search_progress: Arc<SearchProgress>,
@@ -796,7 +796,9 @@ impl App for AppState {
                     ui.label("深さ");
                     ui.add_enabled(
                         !self.is_searching,
-                        egui::TextEdit::singleline(&mut self.depth_input).desired_width(80.0),
+                        egui::DragValue::new(&mut self.depth_input)
+                            .range(0..=249)
+                            .speed(1.0),
                     );
                     explore_requested = ui
                         .add_enabled(!self.is_searching, egui::Button::new("探索"))
@@ -845,16 +847,11 @@ impl App for AppState {
             });
 
         if explore_requested || search_requested {
-            match self.depth_input.parse::<usize>() {
-                Ok(depth) => {
-                    self.cli.depth = depth;
-                    if explore_requested {
-                        self.start_search();
-                    } else {
-                        self.start_display();
-                    }
-                }
-                Err(_) => self.search_error = Some("深さは正の整数で入力してください".to_string()),
+            self.cli.depth = self.depth_input;
+            if explore_requested {
+                self.start_search();
+            } else {
+                self.start_display();
             }
         }
 
@@ -888,6 +885,7 @@ impl App for AppState {
                         progress.prefix_total
                     ));
                 });
+            }
             //     if progress.db_insert_active {
             //         let insert_fraction = if progress.db_insert_total == 0 {
             //             0.0
@@ -900,7 +898,7 @@ impl App for AppState {
             //             progress.db_insert_done, progress.db_insert_total
             //         )));
             //     }
-            //     ui.label(format!("経過時間: {:?}", self.start_time.elapsed()));
+            ui.label(format!("経過時間: {:?}", self.start_time.elapsed()));
             // }
 
             if let Some(result) = &self.search_results {
@@ -983,7 +981,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 start_time: Instant::now(),
                 search_results: None,
                 search_tree: Vec::new(),
-                depth_input: cli.depth.to_string(),
+                depth_input: cli.depth,
                 search_error: None,
                 log_entries: Arc::clone(&log_entries),
                 search_progress: Arc::new(SearchProgress::default()),
