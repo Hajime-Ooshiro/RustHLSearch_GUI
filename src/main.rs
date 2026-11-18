@@ -163,6 +163,7 @@ struct AppState {
     log_entries: Arc<Mutex<VecDeque<String>>>,
     search_progress: Arc<SearchProgress>,
     interrupted: Arc<AtomicBool>,
+    exit_requested: Arc<AtomicBool>,
     search_thread: Option<JoinHandle<Result<OutputFile<'static>, String>>>,
     is_searching: bool,
     maximum_stored_depth: Result<Option<usize>, String>,
@@ -640,6 +641,23 @@ fn show_search_tree(ui: &mut egui::Ui, nodes: &[TreeNode]) {
 
 impl App for AppState {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if self.exit_requested.load(Ordering::SeqCst) {
+            if self
+                .search_thread
+                .as_ref()
+                .map(JoinHandle::is_finished)
+                .unwrap_or(true)
+            {
+                if self.search_thread.is_some() {
+                    self.finish_search();
+                }
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                return;
+            }
+            ctx.request_repaint_after(Duration::from_millis(100));
+            return;
+        }
+
         if self
             .search_thread
             .as_ref()
@@ -803,10 +821,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }))?;
     log::set_max_level(LevelFilter::Info);
     let interrupted = Arc::new(AtomicBool::new(false));
+    let exit_requested = Arc::new(AtomicBool::new(false));
     {
         let interrupted = Arc::clone(&interrupted);
+        let exit_requested = Arc::clone(&exit_requested);
         ctrlc::set_handler(move || {
             interrupted.store(true, Ordering::SeqCst);
+            exit_requested.store(true, Ordering::SeqCst);
         })?;
     }
 
@@ -849,6 +870,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 log_entries: Arc::clone(&log_entries),
                 search_progress: Arc::new(SearchProgress::default()),
                 interrupted: Arc::clone(&interrupted),
+                exit_requested: Arc::clone(&exit_requested),
                 search_thread: None,
                 is_searching: false,
                 maximum_stored_depth,

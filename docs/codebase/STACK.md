@@ -18,7 +18,7 @@
 | `serde` / `serde_json` | Checkpoint, node, and result serialization | `Cargo.toml`, `src/search.rs:36-101`, `src/rocksdb_output.rs:76-82` |
 | `log` | Application logging | `Cargo.toml`, `src/main.rs:36-73` |
 | `simple_logger` | Referenced by the commented legacy CLI path | `Cargo.toml`, `src/main.rs:143-286` |
-| `ctrlc` | Referenced by the commented legacy CLI path | `Cargo.toml`, `src/main.rs:143-286` |
+| `ctrlc` | Interrupts active searches and requests application exit | `Cargo.toml`, `src/main.rs:821-831` |
 | `chrono` | Timestamped output path helper | `Cargo.toml`, `src/output.rs:1-25` |
 
 ## Tooling

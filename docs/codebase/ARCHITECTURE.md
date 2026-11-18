@@ -49,7 +49,7 @@ CLI defaults / GUI input
 - Search runs on a spawned thread (`src/main.rs:396-438`).
 - Progress is shared through atomics (`src/search.rs:110-194`).
 - Parallel candidate evaluation uses Rayon; persistence and aggregate result updates remain coordinated by the search state (`src/search.rs:382-465`).
-- Ctrl+C handling exists in the commented legacy CLI implementation; the active GUI path has an `AtomicBool` field but no active signal registration (`src/main.rs:289-306`, `src/main.rs:143-286`). **[ASK USER]** Confirm whether interrupt handling should be restored for the active GUI path.
+- Ctrl+C sets both the search interrupt and exit-request atomics. The GUI waits for the search worker to finish checkpoint handling, joins it, and then closes the viewport (`src/main.rs:641-658`, `src/main.rs:821-831`).
 
 ## Evidence
 

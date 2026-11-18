@@ -4,7 +4,6 @@
 
 1. **Large orchestration module:** `src/main.rs` combines CLI parsing, logging, font discovery, search orchestration, result modeling, and all GUI rendering. This creates a broad change surface for UI or startup changes (`src/main.rs:1-1004`).
 2. **Legacy commented implementation:** A substantial CLI/progress-bar implementation remains commented out in `src/main.rs:143-286`. It references APIs/dependencies that are not part of the active GUI path and can obscure the current execution model.
-3. **Interrupt path is incomplete in the active app:** `AppState` owns an `AtomicBool`, but active GUI startup does not register a Ctrl+C handler; the handler exists only in the commented block (`src/main.rs:143-286`, `src/main.rs:289-306`).
 4. **Fixed algorithm thresholds and limits:** target score `447`, maximum prime `1579`, maximum depth `249`, 210 shards, and display limit 30 are constants spread across modules (`src/search.rs:17-33`, `src/search.rs:196-250`, `src/rocksdb_output.rs:21-39`, `src/main.rs:24-25`). Changing them requires coordinated compatibility review.
 5. **RocksDB resource footprint:** `ShiftPathStore::create` opens 210 RocksDB instances and uses shared cache/write-buffer resources (`src/rocksdb_output.rs:129-204`). This is intentional for the storage layout but may be expensive on constrained systems.
 6. **Persistence compatibility is strict:** existing single-DB and 256-shard layouts are rejected without migration (`src/rocksdb_output.rs:206-227`), so upgrades require an operational backup/move procedure.

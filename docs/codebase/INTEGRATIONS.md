@@ -6,7 +6,7 @@
 - **RocksDB:** local embedded persistence; no network database or remote service is configured (`Cargo.toml`, `src/rocksdb_output.rs`).
 - **Rayon:** CPU parallelism for frontier evaluation (`Cargo.toml`, `src/search.rs:382-429`).
 - **OS font files:** Japanese font discovery checks Windows, macOS, and Linux paths (`src/main.rs:440-505`).
-- **Ctrl+C handler:** dependency is declared and used only in the commented legacy CLI path (`Cargo.toml`, `src/main.rs:143-286`).
+- **Ctrl+C handler:** sets the active search interrupt flag and requests application exit after the worker saves and reports its checkpoint (`Cargo.toml`, `src/main.rs:821-831`, `src/main.rs:641-658`).
 
 ## Storage interface
 
