@@ -10,6 +10,7 @@
 //! そのためビッグエンディアンのキー順 = (深さ, 連番) 順となり、
 //! 特定の深さのノードを範囲スキャンで列挙できる。
 
+use crate::config::{MAX_SEARCH_DEPTH, SHARD_COUNT};
 use rocksdb::{
     BlockBasedOptions, Cache, ColumnFamilyDescriptor, Direction, IteratorMode, Options, WriteBatch,
     WriteBufferManager, DB,
@@ -20,9 +21,8 @@ use std::collections::{BinaryHeap, HashMap};
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 
-const MAX_DEPTH: usize = 249;
+const MAX_DEPTH: usize = MAX_SEARCH_DEPTH;
 const APPEND_BATCH_SIZE: usize = 30030;
-const SHARD_COUNT: usize = 210;
 const SHARED_CACHE_SIZE: usize = 32 * 1024 * 1024;
 const SHARED_WRITE_BUFFER_SIZE: usize = 128 * 1024 * 1024;
 const SHARD_BITS: u32 = 8;

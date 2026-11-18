@@ -27,7 +27,7 @@ cargo build --release
 
 ### Windows 用バッチファイル
 
-Windows 環境向けに `build.bat` も用意されています（デバッグビルドおよびリリースビルドを順に実行）。
+Windows 環境向けに `build.bat` も用意されています。フォーマット、テスト、Clippy、リリースビルドを順に実行し、失敗時は停止します。
 
 ```cmd
 build.bat
@@ -54,10 +54,12 @@ cargo clippy --all-targets -- -D warnings
 ```text
 src/
   main.rs      # GUI、CLI解析、入力検証、探索実行
+  cli.rs       # CLI引数定義と入力検証
+  config.rs    # 探索・永続化の共通定数
+  error.rs     # GUIスレッド境界の構造化エラー
   bitmask.rs   # BitMaskによる64-bit単位のビット演算
   primes.rs    # エラトステネスの篩による素数生成
   search.rs    # シフトテーブル生成、ビームサーチ、チェックポイント
-  output.rs    # 出力パス名のタイムスタンプ処理
   rocksdb_output.rs # RocksDB による親ノード形式シフトパス永続化
 ```
 

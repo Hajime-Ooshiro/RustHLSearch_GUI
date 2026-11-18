@@ -1,11 +1,16 @@
 mod bitmask;
-mod output;
+mod cli;
+mod config;
+mod error;
 mod primes;
 mod rocksdb_output;
 mod search;
 
 use clap::Parser;
+use cli::Cli;
+use config::{MAX_DISPLAY_RESULTS, MAX_SEARCH_DEPTH};
 use eframe::{egui, App};
+use error::AppError;
 use log::{info, Level, LevelFilter, Log, Metadata, Record};
 use primes::{generate_primes, MAX_PRIME};
 use search::{build_shift_table, SearchMode, SearchProgress, State};
@@ -23,7 +28,6 @@ const CHECKPOINT_FILENAME: &str = "checkpoint.json";
 const CHECKPOINT_BACKUP_FILENAME: &str = "checkpoint.bak";
 const LOG_FILENAME: &str = "hlsearch.log";
 const MAX_LOG_ENTRIES: usize = 500;
-const MAX_DISPLAY_RESULTS: usize = 30;
 
 fn format_total_count(total_count: u64) -> String {
     if total_count > 1_000 {
@@ -97,61 +101,6 @@ struct OutputResult {
     target_shifts: Vec<Vec<usize>>,
 }
 
-#[derive(Parser, Debug, Clone)]
-#[command(
-    author,
-    version,
-    about = "HLSearch: 素数シフト探索 GUI (Rust版)",
-    long_about = "CLI引数はGUIの初期設定に使用されます。起動後、Searchボタンで探索を開始します。"
-)]
-pub struct Cli {
-    #[arg(short, long, default_value_t = 8, help = "探索する階層数")]
-    pub depth: usize,
-
-    #[arg(
-        short,
-        long,
-        value_enum,
-        default_value_t = SearchMode::Parallel,
-        help = "探索モード (sequential | parallel)"
-    )]
-    pub mode: SearchMode,
-
-    #[arg(long, default_value_t = 3159, help = "列数 (長さ)")]
-    pub cols: usize,
-
-    #[arg(short, long, default_value = ".", help = "出力ディレクトリ")]
-    pub output_dir: PathBuf,
-
-    #[arg(
-        long,
-        default_value_t = 100_000,
-        help = "チェックポイント保存周期 (ノード数)"
-    )]
-    pub checkpoint_interval: u64,
-}
-
-impl Cli {
-    fn validate(&self, available_primes: usize) -> Result<(), String> {
-        if self.depth == 0 {
-            return Err("depth must be at least 1".to_string());
-        }
-        if self.cols == 0 {
-            return Err("cols must be at least 1".to_string());
-        }
-        if self.checkpoint_interval == 0 {
-            return Err("checkpoint-interval must be at least 1".to_string());
-        }
-        if self.depth > available_primes {
-            return Err(format!(
-                "depth ({}) cannot exceed available primes ({})",
-                self.depth, available_primes
-            ));
-        }
-        Ok(())
-    }
-}
-
 struct AppState {
     cli: Cli,
     operation_started_at: Option<Instant>,
@@ -165,7 +114,7 @@ struct AppState {
     interrupted: Arc<AtomicBool>,
     exit_requested: Arc<AtomicBool>,
     force_exit: Arc<AtomicBool>,
-    search_thread: Option<JoinHandle<Result<OutputFile<'static>, String>>>,
+    search_thread: Option<JoinHandle<Result<OutputFile<'static>, AppError>>>,
     is_searching: bool,
     maximum_stored_depth: Result<Option<usize>, String>,
 }
@@ -175,7 +124,7 @@ fn is_checkpoint_interrupt_error(error: &str) -> bool {
 }
 
 type AppOperation =
-    fn(Cli, Arc<SearchProgress>, Arc<AtomicBool>, Instant) -> Result<OutputFile<'static>, String>;
+    fn(Cli, Arc<SearchProgress>, Arc<AtomicBool>, Instant) -> Result<OutputFile<'static>, AppError>;
 
 struct TreeNode {
     shift: Option<usize>,
@@ -311,8 +260,8 @@ impl AppState {
                     build_search_tree(&result.result.shifts, &result.result.path_scores);
                 self.search_results = Some(result);
             }
-            Ok(Err(error)) => self.search_error = Some(error),
-            Err(_) => self.search_error = Some("検索スレッドが異常終了しました".to_string()),
+            Ok(Err(error)) => self.search_error = Some(error.to_string()),
+            Err(_) => self.search_error = Some(AppError::ThreadPanicked.to_string()),
         }
     }
 }
@@ -389,7 +338,7 @@ fn run_search(
     progress: Arc<SearchProgress>,
     interrupted: Arc<AtomicBool>,
     start_time: Instant,
-) -> Result<OutputFile<'static>, String> {
+) -> Result<OutputFile<'static>, AppError> {
     let all_primes = generate_primes(MAX_PRIME);
     cli.validate(all_primes.len())?;
     info!("HLSearch (Rust) GUI Mode Start");
@@ -412,12 +361,10 @@ fn run_search(
             cli.depth,
             resume_path.is_none(),
         )
-        .map_err(|error| error.to_string())?;
+        .map_err(AppError::from)?;
 
     if resume_path.is_none() {
-        state
-            .set_search_complete(false)
-            .map_err(|error| error.to_string())?;
+        state.set_search_complete(false).map_err(AppError::from)?;
     }
 
     if cli.depth > 1 {
@@ -439,7 +386,7 @@ fn run_search(
                     resume_path,
                     &interrupted,
                 )
-                .map_err(|error| error.to_string())?;
+                .map_err(AppError::from)?;
             (
                 completed,
                 OutputResult {
@@ -461,7 +408,7 @@ fn run_search(
                     resume_path,
                     &interrupted,
                 )
-                .map_err(|error| error.to_string())?;
+                .map_err(AppError::from)?;
             (
                 completed,
                 OutputResult {
@@ -478,18 +425,16 @@ fn run_search(
     };
 
     if !completed {
-        return Err(format!(
+        return Err(AppError::Search(format!(
             "検索が中断されました。チェックポイントを保存しました: {}",
             checkpoint_path.display()
-        ));
+        )));
     }
 
-    state
-        .set_search_complete(true)
-        .map_err(|error| error.to_string())?;
+    state.set_search_complete(true).map_err(AppError::from)?;
     let stored_records = state
         .load_top_scored_paths(cli.depth, MAX_DISPLAY_RESULTS)
-        .map_err(|error| error.to_string())?;
+        .map_err(AppError::from)?;
     if !stored_records.is_empty() {
         let (path_scores, shifts): (Vec<_>, Vec<_>) = stored_records.into_iter().unzip();
         result.max_score = path_scores[0];
@@ -497,14 +442,12 @@ fn run_search(
         result.path_scores = path_scores;
         result.shifts = shifts;
     }
-    result.total_count = state
-        .count_depth_paths(cli.depth)
-        .map_err(|error| error.to_string())?;
+    result.total_count = state.count_depth_paths(cli.depth).map_err(AppError::from)?;
 
     for filename in [CHECKPOINT_FILENAME, CHECKPOINT_BACKUP_FILENAME] {
         let checkpoint_path = cli.output_dir.join(filename);
         if checkpoint_path.exists() {
-            std::fs::remove_file(&checkpoint_path).map_err(|error| error.to_string())?;
+            std::fs::remove_file(&checkpoint_path).map_err(AppError::from)?;
             info!(
                 "Removed completed search checkpoint: {}",
                 checkpoint_path.display()
@@ -531,7 +474,7 @@ fn load_saved_results(
     _progress: Arc<SearchProgress>,
     _interrupted: Arc<AtomicBool>,
     start_time: Instant,
-) -> Result<OutputFile<'static>, String> {
+) -> Result<OutputFile<'static>, AppError> {
     let all_primes = generate_primes(MAX_PRIME);
     cli.validate(all_primes.len())?;
 
@@ -539,14 +482,12 @@ fn load_saved_results(
     let mut state = State::new(all_primes, cli.cols, shift_table);
     state
         .set_shift_path_store(&cli.output_dir.join("HLSearch.rocksdb"), cli.depth, false)
-        .map_err(|error| error.to_string())?;
+        .map_err(AppError::from)?;
 
     let stored_records = state
         .load_top_scored_paths(cli.depth, MAX_DISPLAY_RESULTS)
-        .map_err(|error| error.to_string())?;
-    let total_count = state
-        .count_depth_paths(cli.depth)
-        .map_err(|error| error.to_string())?;
+        .map_err(AppError::from)?;
+    let total_count = state.count_depth_paths(cli.depth).map_err(AppError::from)?;
     let (path_scores, shifts): (Vec<_>, Vec<_>) = stored_records.into_iter().unzip();
     let max_score = path_scores.first().copied().unwrap_or(0);
     info!(
@@ -712,7 +653,7 @@ impl App for AppState {
                     ui.add_enabled(
                         !self.is_searching,
                         egui::DragValue::new(&mut self.depth_input)
-                            .range(0..=249)
+                            .range(0..=MAX_SEARCH_DEPTH)
                             .speed(1.0),
                     );
                     explore_requested = ui
@@ -1044,7 +985,7 @@ mod tests {
         let mut cli = test_cli();
         cli.depth = 4;
         assert_eq!(
-            cli.validate(3).unwrap_err(),
+            cli.validate(3).unwrap_err().to_string(),
             "depth (4) cannot exceed available primes (3)"
         );
     }
@@ -1137,7 +1078,9 @@ mod tests {
         );
 
         let error = result.err().unwrap();
-        assert!(error.contains("検索が中断されました。チェックポイントを保存しました"));
+        assert!(error
+            .to_string()
+            .contains("検索が中断されました。チェックポイントを保存しました"));
         assert!(checkpoint_path.exists());
         std::fs::remove_dir_all(output_dir).unwrap();
     }

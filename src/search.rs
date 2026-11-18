@@ -1,4 +1,5 @@
 use crate::bitmask::BitMask;
+use crate::config::{DEFAULT_CHECKPOINT_INTERVAL, MAX_SEARCH_DEPTH, TARGET_SCORE};
 use crate::rocksdb_output::ShiftPathStore;
 use log::{debug, info};
 use rayon::prelude::*;
@@ -215,13 +216,13 @@ impl State {
             primes,
             zero_mask: BitMask::new_ones(cols),
             max_score: 0,
-            target: 447,
+            target: TARGET_SCORE,
             target_count: 0,
             target_shifts: Vec::new(),
             results: 0,
             shifts: Vec::new(),
             node_count: 0,
-            checkpoint_interval: 100_000,
+            checkpoint_interval: DEFAULT_CHECKPOINT_INTERVAL,
             shift_table,
             shift_path_store: None,
             progress_reporter: None,
@@ -453,7 +454,7 @@ impl State {
         score: usize,
         key: &[usize],
     ) -> Result<(), String> {
-        if depth == 249 && score == self.target {
+        if depth == MAX_SEARCH_DEPTH && score == self.target {
             let target_count = self.target_count + 1;
             if let Some(store) = &self.shift_path_store {
                 store.append_target(target_count, key)?;

@@ -1,6 +1,6 @@
 /// 素数生成（エラトステネスの篩）
 pub const MIN_PRIME: usize = 2;
-pub const MAX_PRIME: usize = 1579;
+pub use crate::config::MAX_PRIME;
 
 pub fn generate_primes(limit: usize) -> Vec<usize> {
     if limit < MIN_PRIME {
