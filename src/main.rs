@@ -303,6 +303,7 @@ fn run_search(
 ) -> Result<OutputFile<'static>, AppError> {
     let all_primes = generate_primes(MAX_PRIME);
     cli.validate(all_primes.len())?;
+    cli.validate_for_primes(&all_primes[..cli.depth])?;
     info!("HLSearch (Rust) GUI Mode Start");
 
     let shift_table = build_shift_table(&all_primes[..cli.depth], cli.cols);
@@ -439,6 +440,7 @@ fn load_saved_results(
 ) -> Result<OutputFile<'static>, AppError> {
     let all_primes = generate_primes(MAX_PRIME);
     cli.validate(all_primes.len())?;
+    cli.validate_for_primes(&all_primes[..cli.depth])?;
 
     let shift_table = build_shift_table(&all_primes[..cli.depth], cli.cols);
     let mut state = State::new(all_primes, cli.cols, shift_table);
@@ -947,6 +949,16 @@ mod tests {
             cli.validate(3).unwrap_err().to_string(),
             "depth (4) cannot exceed available primes (3)"
         );
+    }
+
+    #[test]
+    fn cli_validation_rejects_shift_table_that_is_too_large() {
+        let mut cli = test_cli();
+        let primes = generate_primes(MAX_PRIME);
+        cli.depth = primes.len();
+        cli.cols = 1_000_000;
+
+        assert!(cli.validate_for_primes(&primes).is_err());
     }
 
     #[test]

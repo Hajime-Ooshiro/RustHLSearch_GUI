@@ -107,6 +107,8 @@ struct Checkpoint {
     beam_saved_prefix_batches: bool,
     #[serde(default)]
     beam_next_frontier_checkpointed: bool,
+    #[serde(default)]
+    prefix_after_node_id: Option<u64>,
 }
 
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, clap::ValueEnum, Deserialize, Serialize)]
@@ -359,14 +361,15 @@ impl State {
             .shift_path_store
             .as_ref()
             .ok_or_else(|| "RocksDB output is not configured".to_string())?;
-        let mut candidates: Vec<_> = store
-            .load_full_depth_paths(depth)?
-            .into_iter()
-            .filter_map(|key| {
-                let score = self.rebuild_masks(depth, &key)[key.len()].count_ones();
-                (score >= self.target).then_some(BeamCandidate { key, score })
-            })
-            .collect();
+        let mut candidates = Vec::new();
+        for key in store.load_full_depth_paths(depth)? {
+            self.validate_path(&key, depth)
+                .map_err(|error| error.to_string())?;
+            let score = self.rebuild_masks(depth, &key)[key.len()].count_ones();
+            if score >= self.target {
+                candidates.push(BeamCandidate { key, score });
+            }
+        }
         candidates.sort_unstable_by(|left, right| {
             right
                 .score
@@ -481,13 +484,13 @@ impl State {
         checkpoint_path: Option<&Path>,
         interrupted: &AtomicBool,
         mode: SearchMode,
+        mut after_node_id: Option<u64>,
     ) -> Result<(SharedResults, bool), Box<dyn std::error::Error>> {
         let store = self
             .shift_path_store
             .as_ref()
             .cloned()
             .ok_or("RocksDB output is not configured")?;
-        let mut after_node_id = None;
         let mut pending_appends = Vec::with_capacity(SHIFT_PATH_BATCH_SIZE);
 
         self.max_score = 0;
@@ -514,7 +517,12 @@ impl State {
                 self.submit_shift_path_batch(&mut pending_appends)
                     .map_err(std::io::Error::other)?;
                 store.flush().map_err(std::io::Error::other)?;
-                self.write_saved_prefix_batch_checkpoint(checkpoint_path, mode, depth)?;
+                self.write_saved_prefix_batch_checkpoint(
+                    checkpoint_path,
+                    mode,
+                    depth,
+                    after_node_id,
+                )?;
                 return Ok((SharedResults::default(), false));
             }
 
@@ -523,7 +531,7 @@ impl State {
                 .map_err(std::io::Error::other)?;
             let Some((last_node_id, _)) = batch.last() else {
                 store.flush().map_err(std::io::Error::other)?;
-                self.write_saved_prefix_batch_checkpoint(checkpoint_path, mode, depth)?;
+                self.write_saved_prefix_batch_checkpoint(checkpoint_path, mode, depth, None)?;
                 return Ok((
                     SharedResults {
                         max_score: self.max_score,
@@ -587,7 +595,12 @@ impl State {
                         self.submit_shift_path_batch(&mut pending_appends)
                             .map_err(std::io::Error::other)?;
                         store.flush().map_err(std::io::Error::other)?;
-                        self.write_saved_prefix_batch_checkpoint(checkpoint_path, mode, depth)?;
+                        self.write_saved_prefix_batch_checkpoint(
+                            checkpoint_path,
+                            mode,
+                            depth,
+                            after_node_id,
+                        )?;
                         return Ok((SharedResults::default(), false));
                     };
                     self.node_count += nodes;
@@ -678,14 +691,26 @@ impl State {
             }
             self.apply_checkpoint_config(&checkpoint, depth)?;
             if checkpoint.beam_saved_prefix_batches {
-                return self.search_saved_prefix_batches(depth, checkpoint_path, interrupted, mode);
+                return self.search_saved_prefix_batches(
+                    depth,
+                    checkpoint_path,
+                    interrupted,
+                    mode,
+                    checkpoint.prefix_after_node_id,
+                );
             }
         } else if depth > 1
             && self
                 .has_previous_depth_paths(depth)
                 .map_err(std::io::Error::other)?
         {
-            return self.search_saved_prefix_batches(depth, checkpoint_path, interrupted, mode);
+            return self.search_saved_prefix_batches(
+                depth,
+                checkpoint_path,
+                interrupted,
+                mode,
+                None,
+            );
         }
 
         let (mut frontier, mut level, next_frontier, mut next_index, mut next_shift) = if let Some(
@@ -971,6 +996,7 @@ impl State {
                 beam_next_shift: data.next_shift,
                 beam_saved_prefix_batches: false,
                 beam_next_frontier_checkpointed: true,
+                prefix_after_node_id: None,
             },
         )
     }
@@ -980,6 +1006,7 @@ impl State {
         path: Option<&Path>,
         mode: SearchMode,
         depth: usize,
+        prefix_after_node_id: Option<u64>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let Some(path) = path else {
             return Ok(());
@@ -994,7 +1021,7 @@ impl State {
                 max_score: 0,
                 results: 0,
                 target_count: 0,
-                node_count: 0,
+                node_count: self.node_count,
                 split_depth: 0,
                 completed: Vec::new(),
                 in_progress: Vec::new(),
@@ -1008,6 +1035,7 @@ impl State {
                 beam_next_shift: 0,
                 beam_saved_prefix_batches: true,
                 beam_next_frontier_checkpointed: false,
+                prefix_after_node_id,
             },
         )
     }
@@ -1052,6 +1080,29 @@ impl State {
             )
             .into());
         }
+        if checkpoint.beam_level > depth {
+            return Err(format!(
+                "Checkpoint beam level {} exceeds search depth {}",
+                checkpoint.beam_level, depth
+            )
+            .into());
+        }
+        for candidate in checkpoint
+            .beam_frontier
+            .iter()
+            .flatten()
+            .chain(checkpoint.beam_next_frontier.iter())
+        {
+            self.validate_path(&candidate.key, depth)?;
+        }
+        if checkpoint.beam_next_index > checkpoint.beam_frontier.as_ref().map_or(0, Vec::len) {
+            return Err("Checkpoint frontier index is out of range".into());
+        }
+        if checkpoint.beam_level < depth
+            && checkpoint.beam_next_shift > self.primes[checkpoint.beam_level]
+        {
+            return Err("Checkpoint shift position is out of range".into());
+        }
         let current_hash = self.compute_config_hash();
         if checkpoint.config_hash != 0 && checkpoint.config_hash != current_hash {
             return Err(
@@ -1061,6 +1112,29 @@ impl State {
                 )
                 .into(),
             );
+        }
+        Ok(())
+    }
+
+    fn validate_path(
+        &self,
+        path: &[usize],
+        depth: usize,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if path.len() > depth {
+            return Err(format!(
+                "Checkpoint path length {} exceeds search depth {}",
+                path.len(),
+                depth
+            )
+            .into());
+        }
+        for (level, &shift) in path.iter().enumerate() {
+            if shift >= self.primes[level] {
+                return Err(
+                    format!("Checkpoint shift {} is invalid at level {}", shift, level).into(),
+                );
+            }
         }
         Ok(())
     }
@@ -1125,6 +1199,7 @@ impl State {
                     checkpoint_path,
                     interrupted,
                     SearchMode::Parallel,
+                    checkpoint.prefix_after_node_id,
                 );
             }
         } else if depth > 1
@@ -1137,6 +1212,7 @@ impl State {
                 checkpoint_path,
                 interrupted,
                 SearchMode::Parallel,
+                None,
             );
         }
 
@@ -1711,6 +1787,7 @@ mod tests {
                     beam_next_shift: 1,
                     beam_saved_prefix_batches: false,
                     beam_next_frontier_checkpointed: true,
+                    prefix_after_node_id: None,
                 },
             )
             .unwrap();
@@ -1780,6 +1857,7 @@ mod tests {
                     beam_next_shift: 0,
                     beam_saved_prefix_batches: false,
                     beam_next_frontier_checkpointed: true,
+                    prefix_after_node_id: None,
                 },
             )
             .unwrap();

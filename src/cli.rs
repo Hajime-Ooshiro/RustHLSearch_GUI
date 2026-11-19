@@ -1,4 +1,6 @@
-use crate::config::{DEFAULT_CHECKPOINT_INTERVAL, DEFAULT_COLS, DEFAULT_DEPTH};
+use crate::config::{
+    DEFAULT_CHECKPOINT_INTERVAL, DEFAULT_COLS, DEFAULT_DEPTH, MAX_SHIFT_TABLE_BYTES,
+};
 use crate::error::AppError;
 use crate::search::SearchMode;
 use clap::Parser;
@@ -59,6 +61,28 @@ impl Cli {
             return Err(AppError::InvalidInput(format!(
                 "depth ({}) cannot exceed available primes ({})",
                 self.depth, available_primes
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn validate_for_primes(&self, primes: &[usize]) -> Result<(), AppError> {
+        self.validate(primes.len())?;
+
+        let words = self.cols.div_ceil(64);
+        let table_bytes = primes
+            .iter()
+            .try_fold(0usize, |total, prime| {
+                total.checked_add(prime.checked_mul(words)?.checked_mul(8)?)
+            })
+            .ok_or_else(|| {
+                AppError::InvalidInput("shift table size overflows the platform limit".to_string())
+            })?;
+        if table_bytes > MAX_SHIFT_TABLE_BYTES {
+            return Err(AppError::InvalidInput(format!(
+                "shift table requires approximately {:.1} MiB; limit is {} MiB",
+                table_bytes as f64 / (1024.0 * 1024.0),
+                MAX_SHIFT_TABLE_BYTES / (1024 * 1024)
             )));
         }
         Ok(())
