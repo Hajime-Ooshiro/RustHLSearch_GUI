@@ -29,6 +29,7 @@ This is one native Rust binary. `src/main.rs` owns CLI parsing, logging, Japanes
 - Keep search invariants aligned across sequential and parallel modes. Both modes must produce the same search semantics and use the same target, depth, and configuration-hash rules.
 - Preserve checkpoint compatibility behavior: checkpoint fields commonly use `#[serde(default)]`; resume rejects mismatched depth, mode, or configuration hash. Checkpoint writes use a temporary file and rotate the previous file to `.bak`.
 - Treat RocksDB layout changes as compatibility changes. The current implementation intentionally rejects legacy single-database and 256-shard layouts instead of migrating them.
+- Production uses 210 RocksDB shards; test builds use four shards via `cfg(test)` to keep the suite stable on Windows while preserving the production layout.
 - Persist paths through `ShiftPathStore` APIs rather than adding direct RocksDB access to the UI or search orchestration. Buffered writes must be flushed before reads and before checkpoint/completion decisions.
 - Keep UI mutations on the eframe thread. Search workers communicate through `Arc`, atomics, and their returned `OutputFile`; errors are surfaced through `AppState.search_error` and the UI.
 - Use the existing error boundary: low-level search/storage code commonly returns `Result<_, String>`, while `src/error.rs` converts failures for the GUI worker boundary.

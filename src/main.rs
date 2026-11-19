@@ -2,6 +2,7 @@ mod bitmask;
 mod cli;
 mod config;
 mod error;
+mod logging;
 mod primes;
 mod rocksdb_output;
 mod search;
@@ -10,14 +11,14 @@ use clap::Parser;
 use cli::Cli;
 use config::{MAX_DISPLAY_RESULTS, MAX_SEARCH_DEPTH};
 use eframe::{egui, App};
-use error::AppError;
-use log::{info, Level, LevelFilter, Log, Metadata, Record};
+use error::{AppError, SearchError};
+use log::{info, LevelFilter};
+use logging::{UiLogger, LOG_FILENAME};
 use primes::{generate_primes, MAX_PRIME};
 use search::{build_shift_table, SearchMode, SearchProgress, State};
 use serde::Serialize;
 use std::collections::{HashMap, VecDeque};
-use std::fs::File;
-use std::io::{self, BufWriter, Write};
+use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -26,54 +27,12 @@ use std::time::{Duration, Instant};
 
 const CHECKPOINT_FILENAME: &str = "checkpoint.json";
 const CHECKPOINT_BACKUP_FILENAME: &str = "checkpoint.bak";
-const LOG_FILENAME: &str = "hlsearch.log";
-const MAX_LOG_ENTRIES: usize = 500;
-
 fn format_total_count(total_count: u64) -> String {
     if total_count > 1_000 {
         format!("{:.2e}", total_count as f64)
     } else {
         total_count.to_string()
     }
-}
-
-struct UiLogger {
-    entries: Arc<Mutex<VecDeque<String>>>,
-    writer: Mutex<BufWriter<File>>,
-}
-
-impl Log for UiLogger {
-    fn enabled(&self, metadata: &Metadata<'_>) -> bool {
-        metadata.level() <= Level::Info
-    }
-
-    fn log(&self, record: &Record<'_>) {
-        if !self.enabled(record.metadata()) {
-            return;
-        }
-
-        let entry = format!("[{}] {}", record.level(), record.args());
-        eprintln!("{entry}");
-
-        let mut writer = self
-            .writer
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Err(error) = writeln!(writer, "{entry}").and_then(|()| writer.flush()) {
-            eprintln!("Failed to write log file: {error}");
-        }
-
-        let mut entries = self
-            .entries
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if entries.len() == MAX_LOG_ENTRIES {
-            entries.pop_front();
-        }
-        entries.push_back(entry);
-    }
-
-    fn flush(&self) {}
 }
 
 #[derive(Serialize)]
@@ -321,15 +280,18 @@ fn japanese_font_definitions(font_data: egui::FontData) -> egui::FontDefinitions
 }
 
 fn has_japanese_ui_glyphs(ctx: &egui::Context, font_definitions: &egui::FontDefinitions) -> bool {
-    let mut has_glyphs = false;
-    let _ = ctx.run_ui(egui::RawInput::default(), |ctx| {
-        ctx.set_fonts(font_definitions.clone());
+    let mut setup_output = ctx.run_ui(egui::RawInput::default(), |ui| {
+        ui.ctx().set_fonts(font_definitions.clone());
     });
-    let _ = ctx.run_ui(egui::RawInput::default(), |ctx| {
-        has_glyphs = ctx.fonts_mut(|fonts| {
+    setup_output.textures_delta.clear();
+
+    let mut has_glyphs = false;
+    let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+        has_glyphs = ui.ctx().fonts_mut(|fonts| {
             fonts.has_glyphs(&egui::FontId::proportional(14.0), "日本語の表示確認")
         });
     });
+    output.textures_delta.clear();
     has_glyphs
 }
 
@@ -425,10 +387,10 @@ fn run_search(
     };
 
     if !completed {
-        return Err(AppError::Search(format!(
+        return Err(AppError::Search(SearchError::new(format!(
             "検索が中断されました。チェックポイントを保存しました: {}",
             checkpoint_path.display()
-        )));
+        ))));
     }
 
     state.set_search_complete(true).map_err(AppError::from)?;
@@ -791,7 +753,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let log_entries = Arc::new(Mutex::new(VecDeque::new()));
     log::set_boxed_logger(Box::new(UiLogger {
         entries: Arc::clone(&log_entries),
-        writer: Mutex::new(BufWriter::new(log_file)),
+        writer: Mutex::new(std::io::BufWriter::new(log_file)),
     }))?;
     log::set_max_level(LevelFilter::Info);
     let interrupted = Arc::new(AtomicBool::new(false));
@@ -861,18 +823,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(Box::new(app) as Box<dyn eframe::App>)
         }),
     )
-    .map_err(|e| {
-        std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("Failed to run eframe: {}", e),
-        )
-    })?;
+    .map_err(|e| std::io::Error::other(format!("Failed to run eframe: {}", e)))?;
 
     Ok(())
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+    use log::{Level, Log};
+    use std::{fs::File, io::BufWriter};
 
     #[test]
     fn identifies_checkpoint_interrupt_errors() {

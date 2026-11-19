@@ -58,6 +58,16 @@ struct BeamCandidate {
     score: usize,
 }
 
+struct BeamCheckpointData<'a> {
+    mode: SearchMode,
+    depth: usize,
+    frontier: &'a [BeamCandidate],
+    level: usize,
+    next_frontier: Vec<BeamCandidate>,
+    next_index: usize,
+    next_shift: usize,
+}
+
 #[derive(Deserialize, Serialize)]
 struct Checkpoint {
     #[serde(default)]
@@ -549,7 +559,10 @@ impl State {
                             let score = mask
                                 .bitand_into_count(&base_mask, &self.shift_table[depth - 1][shift]);
                             self.node_count += 1;
-                            if self.node_count % PROGRESS_UPDATE_NODE_INTERVAL == 0 {
+                            if self
+                                .node_count
+                                .is_multiple_of(PROGRESS_UPDATE_NODE_INTERVAL)
+                            {
                                 Self::update_progress(
                                     self.progress_reporter.as_deref(),
                                     self.node_count,
@@ -764,13 +777,15 @@ impl State {
                     .map_err(std::io::Error::other)?;
                 self.write_beam_checkpoint(
                     checkpoint_path,
-                    mode,
-                    depth,
-                    &frontier,
-                    level,
-                    candidates.clone(),
-                    next_index,
-                    next_shift,
+                    BeamCheckpointData {
+                        mode,
+                        depth,
+                        frontier: &frontier,
+                        level,
+                        next_frontier: candidates.clone(),
+                        next_index,
+                        next_shift,
+                    },
                 )?;
                 return Ok((SharedResults::default(), false));
             }
@@ -796,13 +811,15 @@ impl State {
                 };
                 self.write_beam_checkpoint(
                     checkpoint_path,
-                    mode,
-                    depth,
-                    &frontier,
-                    level,
-                    Vec::new(),
-                    0,
-                    0,
+                    BeamCheckpointData {
+                        mode,
+                        depth,
+                        frontier: &frontier,
+                        level,
+                        next_frontier: Vec::new(),
+                        next_index: 0,
+                        next_shift: 0,
+                    },
                 )?;
                 return Ok((results, true));
             }
@@ -836,13 +853,15 @@ impl State {
                     let results = SharedResults::default();
                     self.write_beam_checkpoint(
                         checkpoint_path,
-                        mode,
-                        depth,
-                        &frontier,
-                        level,
-                        Vec::new(),
-                        0,
-                        0,
+                        BeamCheckpointData {
+                            mode,
+                            depth,
+                            frontier: &frontier,
+                            level,
+                            next_frontier: Vec::new(),
+                            next_index: 0,
+                            next_shift: 0,
+                        },
                     )?;
                     return Ok((results, true));
                 }
@@ -902,13 +921,15 @@ impl State {
                     .map_err(std::io::Error::other)?;
                 self.write_beam_checkpoint(
                     checkpoint_path,
-                    mode,
-                    depth,
-                    &frontier,
-                    level,
-                    candidates.clone(),
-                    next_index,
-                    next_shift,
+                    BeamCheckpointData {
+                        mode,
+                        depth,
+                        frontier: &frontier,
+                        level,
+                        next_frontier: candidates.clone(),
+                        next_index,
+                        next_shift,
+                    },
                 )?;
                 next_checkpoint = self.node_count.saturating_add(self.checkpoint_interval);
             }
@@ -918,13 +939,7 @@ impl State {
     fn write_beam_checkpoint(
         &self,
         path: Option<&Path>,
-        mode: SearchMode,
-        depth: usize,
-        frontier: &[BeamCandidate],
-        level: usize,
-        next_frontier: Vec<BeamCandidate>,
-        next_index: usize,
-        next_shift: usize,
+        data: BeamCheckpointData<'_>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let Some(path) = path else {
             return Ok(());
@@ -935,8 +950,8 @@ impl State {
         self.write_checkpoint_file(
             path,
             &Checkpoint {
-                mode,
-                depth,
+                mode: data.mode,
+                depth: data.depth,
                 stack: Vec::new(),
                 key: Vec::new(),
                 max_score: self.max_score,
@@ -949,11 +964,11 @@ impl State {
                 pending_prefixes: Vec::new(),
                 work_prefixes: None,
                 config_hash: self.compute_config_hash(),
-                beam_frontier: Some(frontier.to_vec()),
-                beam_level: level,
-                beam_next_frontier: next_frontier,
-                beam_next_index: next_index,
-                beam_next_shift: next_shift,
+                beam_frontier: Some(data.frontier.to_vec()),
+                beam_level: data.level,
+                beam_next_frontier: data.next_frontier,
+                beam_next_index: data.next_index,
+                beam_next_shift: data.next_shift,
                 beam_saved_prefix_batches: false,
                 beam_next_frontier_checkpointed: true,
             },
@@ -1178,13 +1193,15 @@ impl State {
             if interrupted.load(Ordering::SeqCst) {
                 self.write_beam_checkpoint(
                     checkpoint_path,
-                    SearchMode::Parallel,
-                    depth,
-                    &frontier,
-                    level,
-                    Vec::new(),
-                    0,
-                    0,
+                    BeamCheckpointData {
+                        mode: SearchMode::Parallel,
+                        depth,
+                        frontier: &frontier,
+                        level,
+                        next_frontier: Vec::new(),
+                        next_index: 0,
+                        next_shift: 0,
+                    },
                 )?;
                 return Ok((SharedResults::default(), false));
             }
@@ -1208,13 +1225,15 @@ impl State {
                 };
                 self.write_beam_checkpoint(
                     checkpoint_path,
-                    SearchMode::Parallel,
-                    depth,
-                    &frontier,
-                    level,
-                    Vec::new(),
-                    0,
-                    0,
+                    BeamCheckpointData {
+                        mode: SearchMode::Parallel,
+                        depth,
+                        frontier: &frontier,
+                        level,
+                        next_frontier: Vec::new(),
+                        next_index: 0,
+                        next_shift: 0,
+                    },
                 )?;
                 return Ok((results, true));
             }
@@ -1224,13 +1243,15 @@ impl State {
             else {
                 self.write_beam_checkpoint(
                     checkpoint_path,
-                    SearchMode::Parallel,
-                    depth,
-                    &frontier,
-                    level,
-                    Vec::new(),
-                    0,
-                    0,
+                    BeamCheckpointData {
+                        mode: SearchMode::Parallel,
+                        depth,
+                        frontier: &frontier,
+                        level,
+                        next_frontier: Vec::new(),
+                        next_index: 0,
+                        next_shift: 0,
+                    },
                 )?;
                 return Ok((SharedResults::default(), false));
             };
@@ -1256,13 +1277,15 @@ impl State {
             if self.node_count >= next_checkpoint {
                 self.write_beam_checkpoint(
                     checkpoint_path,
-                    SearchMode::Parallel,
-                    depth,
-                    &frontier,
-                    level,
-                    Vec::new(),
-                    0,
-                    0,
+                    BeamCheckpointData {
+                        mode: SearchMode::Parallel,
+                        depth,
+                        frontier: &frontier,
+                        level,
+                        next_frontier: Vec::new(),
+                        next_index: 0,
+                        next_shift: 0,
+                    },
                 )?;
                 next_checkpoint = self.node_count.saturating_add(self.checkpoint_interval);
             }
@@ -1270,13 +1293,15 @@ impl State {
             if frontier.is_empty() {
                 self.write_beam_checkpoint(
                     checkpoint_path,
-                    SearchMode::Parallel,
-                    depth,
-                    &frontier,
-                    level,
-                    Vec::new(),
-                    0,
-                    0,
+                    BeamCheckpointData {
+                        mode: SearchMode::Parallel,
+                        depth,
+                        frontier: &frontier,
+                        level,
+                        next_frontier: Vec::new(),
+                        next_index: 0,
+                        next_shift: 0,
+                    },
                 )?;
                 return Ok((SharedResults::default(), true));
             }

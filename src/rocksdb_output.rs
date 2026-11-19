@@ -1,7 +1,7 @@
 //! シフトパス木の RocksDB 永続化。
 //!
 //! - `nodes` CF:  key = node_id (u64 big-endian)
-//!                value = `{"depth":..,"parent_node_id":..,"shift":..,"score":..}` (JSON)
+//!   value = `{"depth":..,"parent_node_id":..,"shift":..,"score":..}` (JSON)
 //! - `node_index` CF: (parent_node_id, shift) -> node_id (重複ノード検出用の補助インデックス)
 //! - `target_paths` CF: (depth, target_shifts JSON) -> target_count
 //! - `meta` CF: 設定ハッシュ
@@ -374,7 +374,7 @@ impl ShiftPathStore {
 
         let mut batches: Vec<WriteBatch> =
             (0..SHARD_COUNT).map(|_| WriteBatch::default()).collect();
-        let mut has_writes = vec![false; SHARD_COUNT];
+        let mut has_writes = [false; SHARD_COUNT];
         for (node_id, record) in &touched {
             let shard = node_shard(*node_id);
             let nodes_cf = cf(&self.dbs[shard], CF_NODES)?;
@@ -600,10 +600,10 @@ impl ShiftPathStore {
             for (path, parent_id) in paths.iter_mut().zip(parent_ids.iter_mut()) {
                 let node_id =
                     parent_id.ok_or_else(|| format!("depth {depth} の親ノードが欠けています"))?;
-                if !cache.contains_key(&node_id) {
+                if let std::collections::hash_map::Entry::Vacant(entry) = cache.entry(node_id) {
                     let record = read_node(&self.dbs, node_id)?
                         .ok_or_else(|| format!("node_id {node_id} がありません"))?;
-                    cache.insert(node_id, record);
+                    entry.insert(record);
                 }
                 let record = &cache[&node_id];
                 path.push(record.shift);
