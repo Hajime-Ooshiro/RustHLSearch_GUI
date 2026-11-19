@@ -2,47 +2,40 @@
 
 ## Framework and location
 
-Tests use Rust's built-in unit test harness and are colocated with implementation modules:
+The project uses Rust's built-in unit-test harness. Tests are colocated with implementation modules:
 
-- `src/bitmask.rs:77-124`: mask size, popcount, and in-place AND behavior.
-- `src/primes.rs:32-49`: sieve edge cases and inclusive limits.
-- `src/output.rs:28-47`: timestamped path naming.
-- `src/rocksdb_output.rs:738-953`: sharding, append/reopen, ordering, target paths, config hashes, completion state.
-- `src/search.rs:1287-1808`: search modes, pruning, persistence, prefix reuse, checkpoints, and interruption.
-- `src/main.rs:1006-1227`: fonts, logger, tree merging, CLI validation, saved-result behavior, and result serialization.
+- `src/bitmask.rs:76-124`: mask sizing, bit setting, AND, and popcount.
+- `src/primes.rs:31-49`: sieve edge cases and inclusive limits.
+- `src/rocksdb_output.rs:737-953`: sharding, append/reopen, ordering, target paths, hashes, and completion state.
+- `src/search.rs:1287-1808`: beam behavior, prefix reuse, modes, checkpoints, and interruption.
+- `src/main.rs:863-1120`: font/logger helpers, tree construction, CLI validation, persistence orchestration, and result serialization.
 
 ## Commands
 
 ```text
 cargo test
-cargo test beam_search_expands_all_candidates_at_each_level
+cargo test beam_search_keeps_all_unpruned_candidates_at_each_level
+cargo test search::tests::beam_search_keeps_all_unpruned_candidates_at_each_level -- --exact
 cargo fmt -- --check
 cargo clippy --all-targets -- -D warnings
 ```
 
-These commands are documented in `README.md`.
+`build.bat` runs format checking, all tests, Clippy, and the release build on Windows.
 
 ## Test strategy
 
-- Low-level behavior is tested with deterministic unit cases.
-- Search tests use small prime/column configurations and temporary filesystem paths.
-- RocksDB tests exercise real local databases rather than mocks.
-- Checkpoint tests simulate interruption and resume for sequential and parallel modes.
-- GUI tests focus on pure helpers and state transitions; no end-to-end window automation was found. **[TODO]**
-
-## Test concerns
-
-- Tests perform explicit temporary-directory cleanup with `remove_dir_all` (`src/search.rs`, `src/rocksdb_output.rs`).
-- The repository does not show CI execution of the test suite. **[TODO]**
-- No benchmark harness or property-testing dependency was found. **[TODO]**
+- Low-level bitmask and prime generation tests use deterministic in-memory cases.
+- Search and RocksDB tests use small configurations and temporary filesystem directories.
+- Persistence tests exercise real local RocksDB stores rather than mocks.
+- Checkpoint tests cover interruption/resume behavior for sequential and parallel paths.
+- GUI tests target pure helpers and state transitions; no end-to-end window automation is present.
 
 ## Evidence
 
 - `README.md`
-- `src/bitmask.rs:77-124`
-- `src/primes.rs:32-49`
-- `src/output.rs:28-47`
+- `build.bat`
+- `src/bitmask.rs:76-124`
+- `src/primes.rs:31-49`
 - `src/search.rs:1287-1808`
-- `src/rocksdb_output.rs:738-953`
-- `src/main.rs:1006-1227`
-
+- `src/rocksdb_output.rs:737-953`
+- `src/main.rs:863-1120`

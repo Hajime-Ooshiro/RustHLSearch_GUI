@@ -4,46 +4,47 @@
 
 ```text
 .
-├── Cargo.toml              # Package metadata and dependencies
-├── Cargo.lock              # Locked dependency graph
-├── README.md               # User-facing behavior, build, and algorithm notes
-├── build.bat               # Windows debug/release build helper
-├── LICENSE                 # MIT license
+├── Cargo.toml / Cargo.lock
+├── README.md
+├── build.bat
 ├── src/
-│   ├── main.rs             # GUI, CLI configuration, orchestration, UI tests
-│   ├── search.rs           # Search state, beam search, checkpoints, progress
-│   ├── rocksdb_output.rs   # Sharded RocksDB path persistence
-│   ├── bitmask.rs          # 64-bit packed bit mask operations
-│   ├── primes.rs           # Sieve-based prime generation
-│   └── output.rs           # Timestamped path helper
-└── docs/codebase/          # This codebase map
+│   ├── main.rs
+│   ├── search.rs
+│   ├── rocksdb_output.rs
+│   ├── bitmask.rs
+│   ├── primes.rs
+│   ├── cli.rs
+│   ├── config.rs
+│   └── error.rs
+└── docs/codebase/
 ```
 
 ## Entry points
 
-- `main()` in `src/main.rs:929` parses `Cli`, initializes logging/fonts, constructs `AppState`, and starts the eframe window.
-- `AppState::ui()` in `src/main.rs:786` exposes depth, search/display actions, progress, logs, and the result tree.
-- `run_search()` in `src/main.rs:507` creates the search state, configures RocksDB/checkpointing, runs the selected mode, and loads top results.
-- `load_saved_results()` in `src/main.rs:649` reads existing RocksDB results without running a new search.
+- `main()` in `src/main.rs:783-861` parses `Cli`, creates the output directory and logger, installs Ctrl+C handling, validates a Japanese font, and starts eframe.
+- `run_search()` in `src/main.rs:336-470` creates the search state, opens persistence, resumes or starts a search, loads top results, and removes checkpoints after successful completion.
+- `load_saved_results()` in `src/main.rs:472-534` opens the store and displays saved paths without running a new search.
+- `AppState::ui()` and the adjacent rendering helpers in `src/main.rs:560-782` implement the GUI interaction and result tree.
 
 ## Module responsibilities
 
-- `main.rs`: application composition and presentation boundary. It owns GUI state, background thread lifecycle, logging, font discovery, CLI validation, and result-tree layout.
-- `search.rs`: domain/search engine. It builds masks, evaluates candidates, applies the target threshold, persists candidates, reports progress, and serializes/resumes checkpoints.
-- `rocksdb_output.rs`: storage adapter. It stores paths as parent-linked nodes across 210 shards and provides reconstruction, ranking, batching, metadata, and completion state.
-- `bitmask.rs`: low-level value object for packed `u64` masks and popcount.
-- `primes.rs`: deterministic prime input generation using the Sieve of Eratosthenes.
-- `output.rs`: reusable timestamped filename helper; it is currently covered by unit tests but is not part of the active GUI result path.
+- `main.rs`: composition root, GUI, worker lifecycle, logging, font discovery, result presentation, and top-level error conversion.
+- `search.rs`: shift-table construction, sequential/parallel beam search, progress atomics, prefix reuse, checkpoint serialization/resume, and result aggregation.
+- `rocksdb_output.rs`: sharded RocksDB schema, node/index writes, path reconstruction, ranking, metadata, and completion state.
+- `bitmask.rs`: packed `u64` mask value object with in-place AND and popcount.
+- `primes.rs`: Sieve of Eratosthenes up to `MAX_PRIME`.
+- `cli.rs`: command-line options and input validation.
+- `config.rs`: shared search/storage/display constants.
+- `error.rs`: error enum used at the GUI worker boundary.
 
-## Generated/runtime artifacts
+## Runtime artifacts
 
-When a search runs, `--output-dir` may contain `HLSearch.rocksdb/` with `shard-000` through `shard-209`, `checkpoint.json`, `checkpoint.bak`, and `hlsearch.log` (`README.md`, `src/main.rs:507-648`).
+`--output-dir` receives `HLSearch.rocksdb\shard-000` through `shard-209`, `checkpoint.json`, `checkpoint.bak`, and `hlsearch.log` during normal operation (`README.md`, `src/main.rs:336-470`, `src/rocksdb_output.rs:166-204`).
 
 ## Evidence
 
-- `README.md`
 - `Cargo.toml`
-- `src/main.rs:1-134`, `src/main.rs:289-928`
-- `src/search.rs:1-205`
-- `src/rocksdb_output.rs:1-40`
-
+- `README.md`
+- `src/main.rs:1-861`
+- `src/search.rs:1-1285`
+- `src/rocksdb_output.rs:1-740`

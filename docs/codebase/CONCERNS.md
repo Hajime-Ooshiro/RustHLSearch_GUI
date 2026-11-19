@@ -2,26 +2,23 @@
 
 ## Verified implementation concerns
 
-1. **Large orchestration module:** `src/main.rs` combines CLI parsing, logging, font discovery, search orchestration, result modeling, and all GUI rendering. This creates a broad change surface for UI or startup changes (`src/main.rs:1-1004`).
-2. **Legacy commented implementation:** A substantial CLI/progress-bar implementation remains commented out in `src/main.rs:143-286`. It references APIs/dependencies that are not part of the active GUI path and can obscure the current execution model.
-4. **Fixed algorithm thresholds and limits:** target score `447`, maximum prime `1579`, maximum depth `249`, 210 shards, and display limit 30 are constants spread across modules (`src/search.rs:17-33`, `src/search.rs:196-250`, `src/rocksdb_output.rs:21-39`, `src/main.rs:24-25`). Changing them requires coordinated compatibility review.
-5. **RocksDB resource footprint:** `ShiftPathStore::create` opens 210 RocksDB instances and uses shared cache/write-buffer resources (`src/rocksdb_output.rs:129-204`). This is intentional for the storage layout but may be expensive on constrained systems.
-6. **Persistence compatibility is strict:** existing single-DB and 256-shard layouts are rejected without migration (`src/rocksdb_output.rs:206-227`), so upgrades require an operational backup/move procedure.
-7. **No automated CI evidence:** no workflow configuration was found. **[TODO]** Confirm the intended CI/build matrix.
+1. `src/main.rs` combines startup, logging, font discovery, GUI layout, worker lifecycle, search orchestration, and result-tree rendering, so UI/startup changes have a broad change surface (`src/main.rs:1-861`).
+2. A large commented legacy CLI/progress implementation remains in `src/main.rs:143-286`; it is not part of the active GUI path and can obscure the current execution model.
+3. Fixed algorithm/storage invariants are spread across modules: target score `447`, maximum prime `1579`, maximum depth `249`, display limit `30`, beam policy version, and 210 shards (`src/config.rs:1-8`, `src/search.rs:17-33`, `src/rocksdb_output.rs:21-39`).
+4. `ShiftPathStore::create` opens 210 RocksDB instances and shares a 32 MiB cache and 128 MiB write buffer (`src/rocksdb_output.rs:129-204`), which is a significant resource footprint.
+5. Existing single-DB and 256-shard layouts are rejected without migration (`src/rocksdb_output.rs:206-227`); operational changes require a backup/move procedure.
+6. There is no tracked CI workflow, so the repository provides no automated evidence that format, tests, Clippy, and release builds run remotely.
 
-## Potential correctness/maintenance risks
+## Maintenance risks
 
-- `output.rs::with_timestamp` is tested but is not used by the active `run_search()` result path (`src/output.rs:6-25`, `src/main.rs:507-648`). **[ASK USER]** Decide whether timestamped result-file output is still a supported feature or should be removed/documented as legacy.
-- The README describes a wgpu renderer, while `Cargo.toml` enables eframe's `glow`, `wayland`, and `x11` features and the active code does not explicitly configure wgpu (`README.md`, `Cargo.toml`). This is an intent-vs-reality divergence.
-- The README describes CLI result-file output, while the active `main()` starts the GUI and `run_search()` returns results to the UI rather than writing the legacy JSON file path (`README.md`, `src/main.rs:507-648`, `src/main.rs:929-1004`). This is an intent-vs-reality divergence.
-- Production code uses `String` error values at several module boundaries, which loses structured error categories (`src/search.rs`, `src/rocksdb_output.rs`). **[TODO]** No project decision on typed error design was found.
+- Several module boundaries use `String` errors, which loses structured categories (`src/search.rs`, `src/rocksdb_output.rs`). No typed-error migration decision is recorded.
+- Checkpoint and RocksDB compatibility depends on configuration hashes and `BEAM_POLICY_VERSION`; algorithm changes must review resume behavior and persisted data together (`src/search.rs:17-33`, `src/search.rs:1019-1065`).
+- Runtime search can create large persistent stores and long-running checkpoints; changes to batching, node IDs, or ranking require the persistence tests and README storage contract to be updated together.
 
 ## Evidence
 
 - `README.md`
-- `Cargo.toml`
-- `src/main.rs:143-306`, `src/main.rs:507-648`, `src/main.rs:929-1004`
-- `src/search.rs:17-33`, `src/search.rs:196-250`
+- `src/main.rs:143-286`, `src/main.rs:336-861`
+- `src/config.rs`
+- `src/search.rs:17-33`, `src/search.rs:917-1065`
 - `src/rocksdb_output.rs:21-39`, `src/rocksdb_output.rs:129-227`
-- `src/output.rs:6-47`
-
