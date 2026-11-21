@@ -504,6 +504,7 @@ impl State {
                 .map_err(std::io::Error::other)?;
             reporter.set_prefix_total(total);
         }
+        let mut next_checkpoint = self.node_count.saturating_add(self.checkpoint_interval);
         Self::update_progress(
             self.progress_reporter.as_deref(),
             self.node_count,
@@ -631,6 +632,15 @@ impl State {
                 self.results,
                 depth,
             );
+            if self.node_count >= next_checkpoint {
+                self.write_saved_prefix_batch_checkpoint(
+                    checkpoint_path,
+                    mode,
+                    depth,
+                    after_node_id,
+                )?;
+                next_checkpoint = self.node_count.saturating_add(self.checkpoint_interval);
+            }
         }
     }
 
